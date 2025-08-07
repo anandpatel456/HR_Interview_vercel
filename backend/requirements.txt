@@ -5,7 +5,8 @@ langchain
 groq
 pydantic
 openai
-PyMuPDF  # for PDF resume parsing
+PyMuPDF
+PyPDF2  # for PDF resume parsing
 protobuf==5.27.3
 streamlit-extras==0.7.5
 openai-whisper==20250625
