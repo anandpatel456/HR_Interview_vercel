@@ -1,10 +1,12 @@
 import React, { useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useLocation } from "react-router-dom"; // ✅ added useLocation
 
 const ResumeUpload = () => {
   const [file, setFile] = useState(null);
   const [status, setStatus] = useState("");
   const navigate = useNavigate();
+  const location = useLocation(); // ✅ to get difficulty passed from Home
+  const difficulty = location.state?.difficulty || "Medium"; // fallback
 
   const handleUpload = async () => {
     if (!file) {
@@ -28,7 +30,10 @@ const ResumeUpload = () => {
       if (data.success) {
         setStatus("✅ Resume uploaded successfully! Redirecting...");
         setTimeout(() => {
-          navigate("/GuidelineInterview", { state: { sessionId: data.session_id } });
+          // ✅ now also pass difficulty to GuidelineInterview
+          navigate("/GuidelineInterview", { 
+            state: { sessionId: data.session_id, difficulty }
+          });
         }, 2000);
       } else {
         setStatus("❌ Error: " + data.error);

@@ -1,9 +1,41 @@
 import React from "react";
 import { useNavigate } from "react-router-dom";
-import logo from "./assets/Logo.jpg"; // make sure to use your logo path
 
 const Home = () => {
   const navigate = useNavigate();
+
+  const interviewCards = [
+    {
+      level: "Easy",
+      title: "Beginner Challenge",
+      description: "Basic introductory questions — perfect for first-time interview practice.",
+      duration: "15m",
+      color: "bg-green-200",
+      textColor: "text-green-800",
+      borderColor: "#86efac",
+      emoji: "🌱"
+    },
+    {
+      level: "Medium",
+      title: "Standard Challenge",
+      description: "Balanced difficulty for experienced candidates. Test your skills.",
+      duration: "15m",
+      color: "bg-yellow-200",
+      textColor: "text-yellow-800",
+      borderColor: "#fde047",
+      emoji: "⚡"
+    },
+    {
+      level: "Hard",
+      title: "Expert Challenge",
+      description: "Tough and detailed questions for seasoned professionals.",
+      duration: "15m",
+      color: "bg-red-200",
+      textColor: "text-red-800",
+      borderColor: "#fca5a5",
+      emoji: "🔥"
+    }
+  ];
 
   return (
     <div className="flex min-h-screen bg-white">
@@ -27,27 +59,35 @@ const Home = () => {
           Practice with AI-powered mock interviews, get personalized feedback, and land your dream job.
         </div>
 
-        {/* Card */}
-        <div className="flex justify-center">
-          <div className="w-80 bg-white rounded-2xl shadow-md p-6 text-center transition transform hover:scale-105 border">
-            <div className="bg-gray-200 p-6 rounded-xl mb-4 flex justify-center">
-              <img src={logo} alt="logo" className="w-16 h-16 rounded-md" />
-            </div>
-            <div className="text-md font-semibold mb-1">Pick Your Interview Challenge</div>
-            <div className="text-sm text-gray-600 mb-3">
-              No pressure, just progress. Pick a topic and begin.
-            </div>
-            <div className="flex justify-center items-center gap-3 text-sm mb-4">
-              <div>⏱️ 15m</div>
-              <span className="bg-yellow-200 px-3 py-1 rounded-full">Medium</span>
-            </div>
-            <button
-              onClick={() => navigate("/resume")}
-              className="bg-black text-white py-2 px-6 rounded-lg hover:bg-gray-800"
+        {/* Cards Container */}
+        <div className="flex justify-center gap-6 flex-wrap">
+          {interviewCards.map((card, index) => (
+            <div
+              key={index}
+              className="w-80 bg-white rounded-2xl shadow-md p-6 text-center transition transform hover:scale-105 border-2 hover:shadow-lg"
+              style={{ borderColor: card.borderColor }}
             >
-              🚀 Start Interview
-            </button>
-          </div>
+              <div className={`${card.color} p-6 rounded-xl mb-4 flex justify-center`}>
+                <div className="text-4xl">{card.emoji}</div>
+              </div>
+              <div className="text-md font-semibold mb-1">{card.title}</div>
+              <div className="text-sm text-gray-600 mb-3">
+                {card.description}
+              </div>
+              <div className="flex justify-center items-center gap-3 text-sm mb-4">
+                <div>⏱️ {card.duration}</div>
+                <span className={`${card.color} ${card.textColor} px-3 py-1 rounded-full font-medium`}>
+                  {card.level}
+                </span>
+              </div>
+              <button
+                onClick={() => navigate("/resume", { state: { difficulty: card.level } })}
+                className="bg-black text-white py-2 px-6 rounded-lg hover:bg-gray-800 transition-colors"
+              >
+                🚀 Start Interview
+              </button>
+            </div>
+          ))}
         </div>
       </div>
     </div>

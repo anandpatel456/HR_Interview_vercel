@@ -12,20 +12,30 @@ const InterviewPage = () => {
   const [sessionId, setSessionId] = useState("");
   const [interviewEnded, setInterviewEnded] = useState(false);
   const [error, setError] = useState("");
-  const [timeLeft, setTimeLeft] = useState(15 * 60); // 15 minutes
+  const [timeLeft, setTimeLeft] = useState(15 * 60);
   const [isBotSpeaking, setIsBotSpeaking] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [chatOpen, setChatOpen] = useState(false);
   const [chatHistory, setChatHistory] = useState([]);
+  const [difficulty, setDifficulty] = useState("Medium"); // track difficulty 
   const endButtonRef = useRef(null);
 
+  // Get sessionId, firstQuestion, difficulty
   useEffect(() => {
     const id = location.state?.sessionId;
+    const firstQ = location.state?.firstQuestion;
+    const diff = location.state?.difficulty || "Medium";
+    setDifficulty(diff);
+
     if (id && typeof id === "string") {
       setSessionId(id);
+      if (firstQ) {
+        setQuestion(firstQ);
+        setStarted(true);
+      }
     } else {
       setError("Invalid or missing session ID. Redirecting to resume upload...");
-      setTimeout(() => navigate("/resume-upload"), 3000);
+      setTimeout(() => navigate("/resume"), 3000);
     }
   }, [location, navigate]);
 
@@ -43,11 +53,11 @@ const InterviewPage = () => {
       setIsBotSpeaking(true);
       const utterance = new SpeechSynthesisUtterance(question);
       utterance.lang = "en-US";
-      utterance.rate = 0.8; // Slower speech rate
+      utterance.rate = 0.8;
       utterance.onend = () => {
         setIsBotSpeaking(false);
-        if (started && !interviewEnded && 'webkitSpeechRecognition' in window) {
-          setTimeout(startListening, 2000); // 2-second delay
+        if (started && !interviewEnded && "webkitSpeechRecognition" in window) {
+          setTimeout(startListening, 2000);
         }
       };
       utterance.onerror = () => {
@@ -60,7 +70,7 @@ const InterviewPage = () => {
   }, [question, started, interviewEnded]);
 
   const startListening = useCallback(() => {
-    if (!('webkitSpeechRecognition' in window)) {
+    if (!("webkitSpeechRecognition" in window)) {
       setError("Speech recognition not supported. Use Chrome.");
       return;
     }
@@ -71,7 +81,7 @@ const InterviewPage = () => {
     recognition.interimResults = true;
 
     recognition.onresult = (event) => {
-      let finalTranscript = '';
+      let finalTranscript = "";
       for (let i = event.resultIndex; i < event.results.length; i++) {
         if (event.results[i].isFinal) finalTranscript += event.results[i][0].transcript;
       }
@@ -82,14 +92,10 @@ const InterviewPage = () => {
         setAnswer("");
       }
     };
-    recognition.onend = () => {
-      setIsListening(false);
-      if (recognition) recognition.stop();
-    };
+    recognition.onend = () => setIsListening(false);
     recognition.onerror = (event) => {
       setIsListening(false);
       setError(`Speech recognition failed: ${event.error}`);
-      if (recognition) recognition.stop();
     };
 
     recognition.start();
@@ -102,12 +108,11 @@ const InterviewPage = () => {
         session_id: sessionId,
         answer: answerText,
         is_complete: true,
+        difficulty, // send difficulty if needed
       });
-      console.log("Submit Answer Response:", response.data);
       if (response.data.end_interview) {
         setInterviewEnded(true);
         const feedbackResponse = await axios.post("http://localhost:8000/end-interview", { session_id: sessionId });
-        console.log("Feedback Response:", feedbackResponse.data);
         if (feedbackResponse.data.success && feedbackResponse.data.feedback) {
           navigate("/feedback", { state: { feedback: feedbackResponse.data.feedback } });
         } else {
@@ -120,45 +125,21 @@ const InterviewPage = () => {
     } catch (error) {
       setError(`Error submitting answer: ${error.response?.data?.detail || error.message}`);
     }
-  }, [sessionId, navigate]);
-
-  const handleStart = async () => {
-    if (!sessionId) {
-      setError("Session ID missing. Please upload resume again.");
-      return;
-    }
-    try {
-      const response = await axios.post("http://localhost:8000/start-interview", { session_id: sessionId });
-      setQuestion(response.data.question);
-      setStarted(true);
-      setError("");
-    } catch (error) {
-      setError(`Error starting interview: ${error.response?.data?.detail || error.message}`);
-    }
-  };
+  }, [sessionId, navigate, difficulty]);
 
   const handleEnd = async () => {
-    if (endButtonRef.current) {
-      endButtonRef.current.disabled = true; // Prevent multiple clicks
-    }
+    if (endButtonRef.current) endButtonRef.current.disabled = true;
     try {
       speechSynthesis.cancel();
       const response = await axios.post("http://localhost:8000/end-interview", { session_id: sessionId });
-      console.log("End Interview Response:", response.data);
       setInterviewEnded(true);
-      if (response.data.success && response.data.feedback) {
-        navigate("/feedback", { state: { feedback: response.data.feedback } });
-      } else {
-        setError("Failed to retrieve feedback.");
-        navigate("/feedback");
-      }
+      navigate("/feedback", { state: { feedback: response.data.feedback || "No feedback available." } });
     } catch (error) {
-      setError(`Error ending interview: ${error.response?.data?.detail || error.message}`);
-      navigate("/feedback");
+      const errorMessage = `Error ending interview: ${error.response?.data?.detail || error.message}`;
+      setError(errorMessage);
+      navigate("/feedback", { state: { feedback: errorMessage, isError: true } });
     } finally {
-      if (endButtonRef.current) {
-        endButtonRef.current.disabled = false; // Re-enable after request
-      }
+      if (endButtonRef.current) endButtonRef.current.disabled = false;
     }
   };
 
@@ -177,18 +158,14 @@ const InterviewPage = () => {
     return () => document.head.removeChild(styleSheet);
   }, []);
 
-  if (!window.speechSynthesis || !('webkitSpeechRecognition' in window)) {
-    return <p className="text-red-500">Browser does not support speech features. Use Chrome and check permissions.</p>;
-  }
-
   return (
     <div className="flex h-screen">
       {/* Sidebar */}
-      <div className={`w-64 bg-gray-800 p-4 text-white transition-all duration-300 ${chatOpen ? 'block' : 'hidden'}`}>
+      <div className={`w-64 bg-gray-800 p-4 text-white ${chatOpen ? 'block' : 'hidden'}`}>
         <h2 className="text-xl font-bold mb-4">Chat History</h2>
         <div className="space-y-2 max-h-[calc(100vh-120px)] overflow-y-auto">
-          {chatHistory.map((msg, index) => (
-            <div key={index} className={`p-2 rounded ${msg.role === "bot" ? "bg-blue-700" : "bg-green-700"}`}>
+          {chatHistory.map((msg, idx) => (
+            <div key={idx} className={`p-2 rounded ${msg.role === "bot" ? "bg-blue-700" : "bg-green-700"}`}>
               <p className="font-semibold">{msg.role === "bot" ? "Bot" : "You"}:</p>
               <p>{msg.text}</p>
             </div>
@@ -196,74 +173,28 @@ const InterviewPage = () => {
         </div>
       </div>
 
-      {/* Main Area */}
-      <div className="flex-1 bg-[#1e1f20] flex flex-col items-center justify-center text-white p-6 relative">
+      {/* Main */}
+      <div className="flex-1 bg-[#1e1f20] flex flex-col justify-center items-center text-white p-6 relative">
         {error && <p className="text-red-500 mb-4">{error}</p>}
-        {!started ? (
+        {interviewEnded ? (
           <div className="text-center">
-            <h1 className="text-3xl font-bold mb-4">🎤 Interview Session</h1>
-            <button
-              onClick={handleStart}
-              className="bg-indigo-600 px-6 py-3 rounded-xl text-lg font-semibold hover:bg-indigo-700 transition"
-              disabled={!sessionId}
-            >
-              Join Interview
+            <h2 className="text-2xl font-bold mb-4">Interview Completed</h2>
+            <button onClick={handleEnd} ref={endButtonRef} className="bg-indigo-600 px-6 py-3 rounded-xl">
+              View Feedback
             </button>
           </div>
         ) : (
-          <div className="w-full max-w-2xl">
-            {interviewEnded ? (
-              <div className="text-center">
-                <h2 className="text-2xl font-bold mb-4">Interview Completed</h2>
-                <button
-                  ref={endButtonRef}
-                  onClick={handleEnd}
-                  className="bg-indigo-600 px-6 py-3 rounded-xl text-lg font-semibold hover:bg-indigo-700 transition"
-                >
-                  View Feedback
-                </button>
-              </div>
-            ) : (
-              <div className="space-y-6">
-                <p className="text-gray-300 text-center">
-                  Time Remaining: {Math.floor(timeLeft / 60)}:{(timeLeft % 60).toString().padStart(2, "0")}
-                </p>
-                {isBotSpeaking && (
-                  <div className="bg-blue-600 text-white p-4 rounded-lg max-w-prose bubble-animation">
-                    <p className="font-semibold">Bot Speaking...</p>
-                  </div>
-                )}
-                {answer && (
-                  <div className="bg-green-600 text-white p-4 rounded-lg max-w-prose">
-                    <p className="font-semibold">You:</p>
-                    <p>{answer}</p>
-                  </div>
-                )}
-                {isListening && !answer && (
-                  <div className="mt-4 flex items-center">
-                    <Mic size={24} className="text-green-500 mr-2" />
-                    <p className="text-green-500 font-semibold">Listening... Speak now!</p>
-                  </div>
-                )}
-                <div className="absolute bottom-10 right-6">
-                  <button
-                    ref={endButtonRef}
-                    onClick={handleEnd}
-                    className="bg-red-600 p-4 rounded-full hover:bg-red-700 transition mr-4"
-                    title="End Interview"
-                  >
-                    <PhoneOff size={24} />
-                  </button>
-                  <button
-                    onClick={() => setChatOpen(!chatOpen)}
-                    className="bg-gray-600 p-4 rounded-full hover:bg-gray-700 transition"
-                    title="Toggle Chat"
-                  >
-                    <MessageCircle size={24} />
-                  </button>
-                </div>
-              </div>
-            )}
+          <div className="space-y-6 w-full max-w-2xl">
+            <p className="text-gray-300 text-center">
+              Time Remaining: {Math.floor(timeLeft / 60)}:{(timeLeft % 60).toString().padStart(2, "0")} | Difficulty: {difficulty}
+            </p>
+            {isBotSpeaking && <div className="bg-blue-600 p-4 rounded-lg bubble-animation">Bot Speaking...</div>}
+            {answer && <div className="bg-green-600 p-4 rounded-lg"><p className="font-semibold">You:</p><p>{answer}</p></div>}
+            {isListening && !answer && <div className="mt-4 flex items-center"><Mic size={24} className="text-green-500 mr-2" />Listening... Speak now!</div>}
+            <div className="absolute bottom-10 right-6">
+              <button onClick={handleEnd} className="bg-red-600 p-4 rounded-full mr-4"><PhoneOff size={24} /></button>
+              <button onClick={() => setChatOpen(!chatOpen)} className="bg-gray-600 p-4 rounded-full"><MessageCircle size={24} /></button>
+            </div>
           </div>
         )}
       </div>

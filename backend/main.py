@@ -7,7 +7,7 @@ import time
 import pickle
 from typing import Dict
 from pydantic import BaseModel
-from langchain_groq import ChatGroq
+from langchain_openai import ChatOpenAI
 from langchain.chains import ConversationChain
 from langchain.memory import ConversationBufferMemory
 from dotenv import load_dotenv
@@ -23,8 +23,7 @@ load_dotenv()
 app = FastAPI()
 
 origins = [
-    "http://localhost:3000", 
-    "http://localhost:5173",  
+    "http://localhost:5173",  # testing localhost
 ]
 
 # Configure CORS to allow the frontend origin
@@ -36,16 +35,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Set Groq API key
-os.environ["GROQ_API_KEY"] = os.getenv("GROQ_API_KEY")
+# Set OpenAI API key
+os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY", "your-openai-api-key-here")
 
 # Initialize LLM and Conversation Chain
-llm = ChatGroq(temperature=0.7, model_name="llama-3.3-70b-versatile")
+llm = ChatOpenAI(temperature=0.7, model_name="gpt-4o-mini")
 memory = ConversationBufferMemory()
 conversation = ConversationChain(llm=llm, memory=memory, verbose=False)
 
 SESSION_FILE = "interview_sessions.pkl"
 interview_sessions: Dict[str, Dict] = {}
+
 
 def load_sessions():
     global interview_sessions
@@ -60,6 +60,7 @@ def load_sessions():
         logger.error(f"Error loading sessions: {e}")
         interview_sessions = {}
 
+
 def save_sessions():
     try:
         with open(SESSION_FILE, "wb") as f:
@@ -68,24 +69,40 @@ def save_sessions():
     except Exception as e:
         logger.error(f"Error saving sessions: {e}")
 
+
 load_sessions()
+
+# ====== MODELS ======
 
 class UserResponse(BaseModel):
     session_id: str
     answer: str
     is_complete: bool = False
 
+
 class EndInterviewRequest(BaseModel):
     session_id: str
 
+
 class StartInterviewRequest(BaseModel):
     session_id: str
+    difficulty: str = "Medium"   # ✅ Added difficulty field (default Medium)
+
 
 class AudioRequest(BaseModel):
     session_id: str
     audio_data: str  # Base64-encoded audio
 
-def run_interview(resume_text: str, chat_history: list, category: str = "general") -> str:
+
+# ====== INTERVIEW LOGIC ======
+
+def run_interview(resume_text: str, chat_history: list, category: str = "general", difficulty: str = "Medium") -> str:
+    difficulty_instruction = {
+        "Easy": "Keep questions very simple and beginner-friendly.",
+        "Medium": "Ask balanced, intermediate-level questions.",
+        "Hard": "Ask challenging deep-dive questions for experts."
+    }
+
     formatted_history = "\n".join([
         f"Interviewer: {turn.get('question', '')}\nCandidate: {turn.get('answer', '')}"
         for turn in chat_history
@@ -96,13 +113,13 @@ def run_interview(resume_text: str, chat_history: list, category: str = "general
         "projects": "Ask a concise project experience question from resume, max 15 words."
     }
     prompt = f"""
-You are a friendly HR interviewer. Ask short, engaging questions, max 15 words.
+You are a friendly HR interviewer. {difficulty_instruction.get(difficulty, '')}
 
 Resume:
 \"\"\"{resume_text}\"\"\"
 
 Past Conversation:
-{formatted_history}
+{formatted_history}   
 
 Ask a single question from category: {category}.
 {instructions[category]}
@@ -114,11 +131,12 @@ Ask a single question from category: {category}.
             response = " ".join(words[:15]) + "?"
         elif not response.endswith("?"):
             response += "?"
-        logger.info(f"Generated question for category {category}: {response}")
+        logger.info(f"Generated question for category {category} [{difficulty}]: {response}")
         return response
     except Exception as e:
         logger.error(f"Error generating question: {e}")
         raise HTTPException(status_code=500, detail="Failed to generate question due to API error.")
+
 
 def generate_feedback(chat_history: list) -> str:
     if not chat_history:
@@ -147,6 +165,9 @@ Keep it concise and human-like.
         logger.error(f"Error generating feedback: {e}")
         raise HTTPException(status_code=500, detail="Failed to generate feedback due to API error.")
 
+
+# ====== ROUTES ======
+
 @app.post("/upload-resume")
 async def upload_resume(resume: UploadFile = File(...)):
     contents = await resume.read()
@@ -158,37 +179,45 @@ async def upload_resume(resume: UploadFile = File(...)):
         "start_time": None,
         "question_count": {"general": 0, "technical": 0, "projects": 0},
         "phase": "general",
-        "ended": False  # New flag to track session end
+        "ended": False
     }
     save_sessions()
     logger.info(f"Uploaded resume for session {session_id}")
     return {"success": True, "session_id": session_id}
+
 
 @app.post("/start-interview")
 async def start_interview(request: StartInterviewRequest):
     session = interview_sessions.get(request.session_id)
     if not session or session.get("ended", False):
         raise HTTPException(status_code=404, detail=f"Session {request.session_id} not found or already ended")
+    
+    # ✅ Store difficulty in session
+    session["difficulty"] = request.difficulty
     session["start_time"] = time.time()
     category = "general"
-    question = run_interview(session["resume"], session["qa_history"], category)
+
+    question = run_interview(session["resume"], session["qa_history"], category, request.difficulty)
     session["qa_history"].append({"question": question, "type": category})
     session["question_count"][category] += 1
     save_sessions()
-    logger.info(f"Started interview for session {request.session_id}")
+    logger.info(f"Started interview for session {request.session_id} with difficulty {request.difficulty}")
     return {"success": True, "question": question, "session_id": request.session_id}
+
 
 @app.post("/submit-answer")
 async def submit_answer(request: UserResponse):
     session = interview_sessions.get(request.session_id)
     if not session or session.get("ended", False):
         raise HTTPException(status_code=404, detail=f"Session {request.session_id} not found or already ended")
+    
     elapsed_time = time.time() - session.get("start_time", time.time())
     if elapsed_time > 15 * 60:
         return await end_interview_internal(request.session_id)
 
     if not session["qa_history"]:
         raise HTTPException(status_code=400, detail="No previous question")
+
     last_qa = session["qa_history"][-1]
     if "answer" not in last_qa:
         last_qa["answer"] = request.answer
@@ -204,17 +233,26 @@ async def submit_answer(request: UserResponse):
                 session["phase"] = "technical_projects"
             next_category = "technical" if last_qa["type"] == "projects" else "projects"
 
-        next_question = run_interview(session["resume"], session["qa_history"], next_category)
+        # ✅ Pass stored difficulty for next question generation
+        next_question = run_interview(
+            session["resume"], 
+            session["qa_history"], 
+            next_category, 
+            session.get("difficulty", "Medium")
+        )
         session["qa_history"].append({"question": next_question, "type": next_category})
         session["question_count"][next_category] += 1
         save_sessions()
-        logger.info(f"Submitted answer for session {request.session_id}, next question: {next_question}")
+        logger.info(f"Submitted answer for {request.session_id}, next question: {next_question}")
         return {"success": True, "question": next_question, "end_interview": False}
+
     return {"success": True, "question": None, "end_interview": False}
+
 
 @app.post("/end-interview")
 async def end_interview(request: EndInterviewRequest):
     return await end_interview_internal(request.session_id)
+
 
 async def end_interview_internal(session_id: str):
     session = interview_sessions.get(session_id)
@@ -223,20 +261,18 @@ async def end_interview_internal(session_id: str):
     try:
         feedback = generate_feedback(session["qa_history"])
         result = {"success": True, "feedback": feedback, "end_interview": True}
-        session["ended"] = True  # Mark as ended instead of deleting immediately
+        session["ended"] = True
         save_sessions()
-        logger.info(f"Ended interview for session {session_id}, feedback: {feedback}")
-        # Schedule session cleanup after response
+        logger.info(f"Ended interview for session {session_id}")
         asyncio.get_event_loop().call_later(1.0, lambda: cleanup_session(session_id))
         return result
     except Exception as e:
-        logger.error(f"Error in end_interview_internal for session {session_id}: {e}")
+        logger.error(f"Error ending interview {session_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
 
 def cleanup_session(session_id: str):
     if session_id in interview_sessions and interview_sessions[session_id].get("ended", False):
         del interview_sessions[session_id]
         save_sessions()
         logger.info(f"Cleaned up session {session_id}")
-
-# Install additional dependencies: pip install fastapi uvicorn python-multipart langchain-groq PyPDF2 python-dotenv SpeechRecognition pyaudio pydub
