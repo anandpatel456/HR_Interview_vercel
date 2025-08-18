@@ -19,7 +19,7 @@ const InterviewPage = () => {
   const [chatHistory, setChatHistory] = useState([]);
   const [difficulty, setDifficulty] = useState("Medium");
   const endButtonRef = useRef(null);
-  const BACKEND_URL = "http://127.0.0.1:8000"; // Correct backend URL
+  const BACKEND_URL = "https://mock-interview-backend-fmu8.onrender.com"; // Correct backend URL
 
   // Get sessionId, firstQuestion, difficulty
   useEffect(() => {
