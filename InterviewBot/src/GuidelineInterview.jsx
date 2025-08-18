@@ -7,35 +7,41 @@ const GuidelineInterview = () => {
   const navigate = useNavigate();
   const location = useLocation();
   const sessionId = location.state?.sessionId;
-  const difficulty = location.state?.difficulty || "Medium"; // Get difficulty from ResumeUpload → Home
+  const difficulty = location.state?.difficulty || "Medium";
+  const BACKEND_URL = "http://127.0.0.1:8000"; // Correct backend URL
 
   const handleStart = async () => {
     if (!sessionId) {
+      console.error("No sessionId provided, redirecting to resume-upload");
       navigate("/resume-upload");
       return;
     }
 
     try {
-      // Start interview with difficulty parameter
-      const response = await axios.post("http://localhost:8000/start-interview", {
-        session_id: sessionId,
-        difficulty,
-      });
-
-      // Navigate to InterviewPage with question, sessionId, difficulty
-      navigate("/interview", {
-        state: {
-          sessionId,
-          difficulty,
-          firstQuestion: response.data.question,
-        },
-      });
-    } catch (error) {
-      console.error(
-        "Error starting interview:",
-        error.response?.data?.detail || error.message
+      console.log(`Starting interview with sessionId: ${sessionId}, difficulty: ${difficulty}`);
+      const response = await axios.post(
+        `${BACKEND_URL}/start-interview`,
+        { session_id: sessionId, difficulty },
+        { headers: { "Content-Type": "application/json" }, timeout: 10000 }
       );
-      alert("Failed to start interview. Please try again.");
+
+      if (response.data.success) {
+        console.log("Interview started successfully:", response.data);
+        navigate("/interview", {
+          state: {
+            sessionId,
+            difficulty,
+            firstQuestion: response.data.question,
+          },
+        });
+      } else {
+        console.error("Failed to start interview:", response.data.detail);
+        alert(`Failed to start interview: ${response.data.detail}`);
+      }
+    } catch (error) {
+      const errorMessage = error.response?.data?.detail || error.message;
+      console.error("Error starting interview:", errorMessage);
+      alert(`Failed to start interview: ${errorMessage}`);
     }
   };
 

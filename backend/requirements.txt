@@ -12,3 +12,5 @@ streamlit-extras==0.7.5
 openai-whisper==20250625
 langchain_openai
 python-dotenv
+aioredis
+redis

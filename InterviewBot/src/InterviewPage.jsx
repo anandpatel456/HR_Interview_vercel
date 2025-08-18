@@ -17,8 +17,9 @@ const InterviewPage = () => {
   const [isListening, setIsListening] = useState(false);
   const [chatOpen, setChatOpen] = useState(false);
   const [chatHistory, setChatHistory] = useState([]);
-  const [difficulty, setDifficulty] = useState("Medium"); // track difficulty 
+  const [difficulty, setDifficulty] = useState("Medium");
   const endButtonRef = useRef(null);
+  const BACKEND_URL = "http://127.0.0.1:8000"; // Correct backend URL
 
   // Get sessionId, firstQuestion, difficulty
   useEffect(() => {
@@ -28,6 +29,7 @@ const InterviewPage = () => {
     setDifficulty(diff);
 
     if (id && typeof id === "string") {
+      console.log(`InterviewPage loaded with sessionId: ${id}, firstQuestion: ${firstQ}, difficulty: ${diff}`);
       setSessionId(id);
       if (firstQ) {
         setQuestion(firstQ);
@@ -35,7 +37,8 @@ const InterviewPage = () => {
       }
     } else {
       setError("Invalid or missing session ID. Redirecting to resume upload...");
-      setTimeout(() => navigate("/resume"), 3000);
+      console.error("No valid sessionId provided");
+      setTimeout(() => navigate("/resume-upload"), 3000);
     }
   }, [location, navigate]);
 
@@ -72,6 +75,7 @@ const InterviewPage = () => {
   const startListening = useCallback(() => {
     if (!("webkitSpeechRecognition" in window)) {
       setError("Speech recognition not supported. Use Chrome.");
+      console.error("Speech recognition not supported");
       return;
     }
     setIsListening(true);
@@ -87,7 +91,7 @@ const InterviewPage = () => {
       }
       if (finalTranscript) {
         setAnswer(finalTranscript);
-        submitAnswer(finalTranscript, true);
+        submitAnswer(finalTranscript);
         setChatHistory((prev) => [...prev, { role: "user", text: finalTranscript }]);
         setAnswer("");
       }
@@ -96,47 +100,66 @@ const InterviewPage = () => {
     recognition.onerror = (event) => {
       setIsListening(false);
       setError(`Speech recognition failed: ${event.error}`);
+      console.error(`Speech recognition error: ${event.error}`);
     };
 
     recognition.start();
   }, [started, interviewEnded]);
 
   const submitAnswer = useCallback(async (answerText) => {
-    if (!answerText || !sessionId) return;
+    if (!answerText || !sessionId) {
+      console.error("No answer or sessionId provided for submitAnswer");
+      return;
+    }
     try {
-      const response = await axios.post("http://localhost:8000/submit-answer", {
-        session_id: sessionId,
-        answer: answerText,
-        is_complete: true,
-        difficulty, // send difficulty if needed
-      });
+      console.log(`Submitting answer for sessionId: ${sessionId}, answer: ${answerText}`);
+      const response = await axios.post(
+        `${BACKEND_URL}/submit-answer`,
+        { session_id: sessionId, answer: answerText, is_complete: true },
+        { headers: { "Content-Type": "application/json" }, timeout: 10000 }
+      );
       if (response.data.end_interview) {
         setInterviewEnded(true);
-        const feedbackResponse = await axios.post("http://localhost:8000/end-interview", { session_id: sessionId });
+        console.log("Interview ended, fetching feedback...");
+        const feedbackResponse = await axios.post(
+          `${BACKEND_URL}/end-interview`,
+          { session_id: sessionId },
+          { headers: { "Content-Type": "application/json" }, timeout: 10000 }
+        );
         if (feedbackResponse.data.success && feedbackResponse.data.feedback) {
           navigate("/feedback", { state: { feedback: feedbackResponse.data.feedback } });
         } else {
           setError("Failed to retrieve feedback.");
+          console.error("No feedback received");
           navigate("/feedback");
         }
       } else if (response.data.question) {
         setQuestion(response.data.question);
+        console.log("Received next question:", response.data.question);
       }
     } catch (error) {
-      setError(`Error submitting answer: ${error.response?.data?.detail || error.message}`);
+      const errorMessage = error.response?.data?.detail || error.message;
+      setError(`Error submitting answer: ${errorMessage}`);
+      console.error("Error submitting answer:", errorMessage);
     }
-  }, [sessionId, navigate, difficulty]);
+  }, [sessionId, navigate]);
 
   const handleEnd = async () => {
     if (endButtonRef.current) endButtonRef.current.disabled = true;
     try {
       speechSynthesis.cancel();
-      const response = await axios.post("http://localhost:8000/end-interview", { session_id: sessionId });
+      console.log(`Ending interview for sessionId: ${sessionId}`);
+      const response = await axios.post(
+        `${BACKEND_URL}/end-interview`,
+        { session_id: sessionId },
+        { headers: { "Content-Type": "application/json" }, timeout: 10000 }
+      );
       setInterviewEnded(true);
       navigate("/feedback", { state: { feedback: response.data.feedback || "No feedback available." } });
     } catch (error) {
-      const errorMessage = `Error ending interview: ${error.response?.data?.detail || error.message}`;
-      setError(errorMessage);
+      const errorMessage = error.response?.data?.detail || error.message;
+      setError(`Error ending interview: ${errorMessage}`);
+      console.error("Error ending interview:", errorMessage);
       navigate("/feedback", { state: { feedback: errorMessage, isError: true } });
     } finally {
       if (endButtonRef.current) endButtonRef.current.disabled = false;
