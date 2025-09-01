@@ -44,7 +44,7 @@ SESSION_FILE = "interview_sessions.pkl"
 interview_sessions: Dict[str, Dict] = {}
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
 USE_REDIS = True
-MAX_INTERVIEW_DURATION = 120  # 2 minutes in seconds
+MIN_INTERVIEW_DURATION = 120  # 2 minutes in seconds as minimum duration
 
 # Redis connection with retry
 async def get_redis():
@@ -396,8 +396,8 @@ async def end_interview_internal(session_id: str):
         duration = session["end_time"] - session["start_time"]
         logger.info(f"Interview duration for session {session_id}: {duration} seconds")
 
-        if duration > MAX_INTERVIEW_DURATION:
-            feedback = "The interview was not completed within 2 minutes. Please try again to receive detailed feedback."
+        if duration < MIN_INTERVIEW_DURATION:
+            feedback = "You have to complete the interview for 2 minutes to receive feedback."
         else:
             feedback = generate_feedback(session["qa_history"])
 
