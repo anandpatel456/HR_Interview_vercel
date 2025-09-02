@@ -44,7 +44,7 @@ SESSION_FILE = "interview_sessions.pkl"
 interview_sessions: Dict[str, Dict] = {}
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
 USE_REDIS = True
-MIN_INTERVIEW_DURATION = 120  # 2 minutes in seconds as minimum duration
+MIN_INTERVIEW_DURATION = 60  # 1 minutes in seconds as minimum duration
 
 # Redis connection with retry
 async def get_redis():
@@ -230,20 +230,19 @@ def generate_feedback(chat_history: list) -> str:
         for turn in chat_history if isinstance(turn, dict) and all(key in turn for key in ['question', 'answer'])
     ])
     system_prompt = f"""
-You are an HR expert providing constructive feedback after a mock interview.
+You are an HR expert providing a single, overall feedback summary after a mock interview.
 
 Transcript:
 {history}
 
 Instructions:
-1. Evaluate each answer for:
-   - Relevance: Does the answer address the question and align with the resume?
-   - Clarity: Is the answer clear and well-structured?
-   - Depth: Does the answer provide sufficient detail or examples?
-2. Identify strengths (e.g., clear communication, relevant examples).
-3. Highlight areas for improvement (e.g., irrelevant answers, lack of detail).
-4. If an answer is off-topic or irrelevant, note it explicitly.
-5. Provide concise, actionable feedback in a friendly tone, referencing specific answers where possible.
+1. Evaluate the overall performance based on all answers for:
+   - Relevance: How well answers addressed questions and aligned with the resume.
+   - Clarity: Overall clarity and structure of responses.
+   - Depth: General depth and use of examples across answers.
+2. Identify overall strengths (e.g., clear communication, relevant examples) as a bullet list starting with "**Overall Strengths:**".
+3. Highlight overall areas for improvement (e.g., lack of detail, off-topic responses) as a bullet list starting with "**Areas for Improvement:**".
+4. Provide concise, actionable feedback in a friendly tone, starting with "Keep practicing".
 """.strip()
     try:
         feedback = conversation.invoke(
@@ -397,7 +396,7 @@ async def end_interview_internal(session_id: str):
         logger.info(f"Interview duration for session {session_id}: {duration} seconds")
 
         if duration < MIN_INTERVIEW_DURATION:
-            feedback = "You have to complete the interview for 2 minutes to receive feedback."
+            feedback = "You have to complete the interview for 1 minutes to receive feedback."
         else:
             feedback = generate_feedback(session["qa_history"])
 
