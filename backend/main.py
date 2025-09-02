@@ -44,7 +44,7 @@ SESSION_FILE = "interview_sessions.pkl"
 interview_sessions: Dict[str, Dict] = {}
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
 USE_REDIS = True
-MIN_INTERVIEW_DURATION = 60  # 1 minutes in seconds as minimum duration
+MIN_INTERVIEW_DURATION = 60  # 1 minute in seconds
 
 # Redis connection with retry
 async def get_redis():
@@ -122,7 +122,7 @@ async def process_resume(file: BytesIO, session_id: str):
 
 # ====== LangChain Setup ======
 
-# Custom in-memory chat history with add_messages support
+# Custom in-memory chat history
 class CustomChatHistory:
     def __init__(self):
         self.messages = []
@@ -384,6 +384,29 @@ async def submit_answer(request: UserResponse):
 async def end_interview(request: EndInterviewRequest):
     return await end_interview_internal(request.session_id)
 
+@app.get("/get-feedback/{session_id}")
+async def get_feedback(session_id: str):
+    if USE_REDIS:
+        redis = await get_redis()
+        if redis:
+            try:
+                feedback = await redis.get(f"feedback_{session_id}")
+                if feedback:
+                    logger.info(f"Retrieved feedback for session {session_id} from Redis")
+                    return {"success": True, "feedback": feedback}
+            except Exception as e:
+                logger.error(f"Error retrieving feedback from Redis: {e}")
+    else:
+        try:
+            with open(f"feedback_{session_id}.txt", "r") as f:
+                feedback = f.read()
+            logger.info(f"Retrieved feedback for session {session_id} from file")
+            return {"success": True, "feedback": feedback}
+        except FileNotFoundError:
+            logger.error(f"Feedback file for session {session_id} not found")
+            pass
+    raise HTTPException(status_code=404, detail="Feedback not found")
+
 async def end_interview_internal(session_id: str):
     logger.info(f"Ending interview for session {session_id}")
     session = interview_sessions.get(session_id)
@@ -396,9 +419,19 @@ async def end_interview_internal(session_id: str):
         logger.info(f"Interview duration for session {session_id}: {duration} seconds")
 
         if duration < MIN_INTERVIEW_DURATION:
-            feedback = "You have to complete the interview for 1 minutes to receive feedback."
+            feedback = "You have to complete the interview for 1 minute to receive feedback."
         else:
             feedback = generate_feedback(session["qa_history"])
+            # Save feedback persistently
+            if USE_REDIS:
+                redis = await get_redis()
+                if redis:
+                    await redis.setex(f"feedback_{session_id}", 24 * 60 * 60, feedback)  # 24-hour TTL
+                    logger.info(f"Saved feedback for session {session_id} to Redis")
+            else:
+                with open(f"feedback_{session_id}.txt", "w") as f:
+                    f.write(feedback)
+                logger.info(f"Saved feedback for session {session_id} to file")
 
         result = {"success": True, "feedback": feedback, "end_interview": True}
         session["ended"] = True
@@ -412,7 +445,7 @@ async def end_interview_internal(session_id: str):
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 async def cleanup_session(session_id: str):
-    await asyncio.sleep(1.0)  # Delay to ensure session is saved
+    await asyncio.sleep(300.0)  # Delay cleanup for 5 minutes
     if session_id in interview_sessions and interview_sessions[session_id].get("ended", False):
         del interview_sessions[session_id]
         await save_sessions()
