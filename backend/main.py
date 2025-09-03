@@ -261,6 +261,10 @@ Instructions:
 async def startup_event():
     await load_sessions()
 
+@app.get("/ping")
+def ping():
+    return {"status": "ok"}
+
 @app.get("/status/{session_id}")
 async def get_status(session_id: str):
     session = interview_sessions.get(session_id)
