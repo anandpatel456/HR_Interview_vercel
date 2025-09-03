@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Response
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from io import BytesIO
 import os
@@ -261,10 +261,6 @@ Instructions:
 async def startup_event():
     await load_sessions()
 
-@app.get("/ping")
-@app.head("/ping")
-async def ping():
-    return Response(content="pong", media_type="text/plain")
 
 @app.get("/status/{session_id}")
 async def get_status(session_id: str):
