@@ -124,7 +124,7 @@ async def process_resume(file: BytesIO, session_id: str):
 
 # Custom in-memory chat history
 class CustomChatHistory:
-    def _init_(self):
+    def __init__(self):
         self.messages = []
 
     def add_message(self, message):
