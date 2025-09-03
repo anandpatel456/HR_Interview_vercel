@@ -1,8 +1,16 @@
-
-fastapi==0.112.0
-uvicorn==0.30.5
-langchain-openai==0.1.22
-langchain-core==0.2.33
-pydantic==2.8.2
-python-dotenv==1.0.1
-PyMuPDF==1.24.9
+fastapi
+uvicorn
+python-multipart
+langchain
+groq
+pydantic
+openai
+PyMuPDF
+PyPDF2  # for PDF resume parsing
+protobuf==5.27.3
+streamlit-extras==0.7.5
+openai-whisper==20250625
+langchain_openai
+python-dotenv
+aioredis
+redis
