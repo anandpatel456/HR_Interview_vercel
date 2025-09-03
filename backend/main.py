@@ -1,20 +1,18 @@
+
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from io import BytesIO
 import os
 import time
 import pickle
-from typing import Dict, List
+import logging
 from pydantic import BaseModel
 from langchain_openai import ChatOpenAI
 from langchain_core.runnables.history import RunnableWithMessageHistory
-from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from dotenv import load_dotenv
-import logging
-import asyncio
 import fitz  # PyMuPDF
-import redis.asyncio as aioredis
+from typing import Dict, List
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -40,87 +38,10 @@ os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY", "your-openai-api-key-
 llm = ChatOpenAI(temperature=0.7, model_name="gpt-4o-mini")
 
 # Session storage
-SESSION_FILE = "interview_sessions.pkl"
+SESSION_FILE = "/tmp/interview_sessions.pkl"
 interview_sessions: Dict[str, Dict] = {}
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
-USE_REDIS = True
 MIN_INTERVIEW_DURATION = 60  # 1 minute in seconds
-
-# Redis connection with retry
-async def get_redis():
-    try:
-        redis = await aioredis.from_url("redis://localhost:6379", encoding="utf-8", decode_responses=True)
-        await redis.ping()
-        logger.info("Connected to Redis successfully")
-        return redis
-    except Exception as e:
-        logger.error(f"Redis connection failed: {e}")
-        global USE_REDIS
-        USE_REDIS = False
-        return None
-
-async def load_sessions():
-    global interview_sessions
-    if USE_REDIS:
-        redis = await get_redis()
-        if redis:
-            try:
-                sessions = await redis.get("interview_sessions")
-                if sessions:
-                    interview_sessions = pickle.loads(sessions.encode())
-                logger.info("Sessions loaded from Redis")
-            except Exception as e:
-                logger.error(f"Error loading sessions from Redis: {e}")
-                interview_sessions = {}
-    else:
-        try:
-            with open(SESSION_FILE, "rb") as f:
-                interview_sessions = pickle.load(f)
-            logger.info("Sessions loaded from file")
-        except FileNotFoundError:
-            interview_sessions = {}
-            logger.info("No session file found, starting with empty sessions")
-        except Exception as e:
-            logger.error(f"Error loading sessions from file: {e}")
-            interview_sessions = {}
-
-async def save_sessions():
-    if USE_REDIS:
-        redis = await get_redis()
-        if redis:
-            try:
-                await redis.set("interview_sessions", pickle.dumps(interview_sessions))
-                logger.info("Sessions saved to Redis")
-            except Exception as e:
-                logger.error(f"Error saving sessions to Redis: {e}")
-    else:
-        try:
-            with open(SESSION_FILE, "wb") as f:
-                pickle.dump(interview_sessions, f)
-            logger.info("Sessions saved to file")
-        except Exception as e:
-            logger.error(f"Error saving sessions to file: {e}")
-
-def extract_text_from_pdf(file: BytesIO) -> str:
-    try:
-        doc = fitz.open(stream=file.read(), filetype="pdf")
-        text = ""
-        for page in doc:
-            text += page.get_text("text")
-        doc.close()
-        logger.info(f"Extracted {len(text)} characters from PDF")
-        return text.strip()
-    except Exception as e:
-        logger.error(f"Error extracting text from PDF: {e}")
-        raise HTTPException(status_code=400, detail="Failed to extract text from PDF")
-
-async def process_resume(file: BytesIO, session_id: str):
-    text = extract_text_from_pdf(file)
-    interview_sessions[session_id]["resume"] = text
-    await save_sessions()
-    logger.info(f"Processed resume for session {session_id}, text length: {len(text)}")
-
-# ====== LangChain Setup ======
 
 # Custom in-memory chat history
 class CustomChatHistory:
@@ -146,14 +67,12 @@ def get_session_history(session_id: str) -> CustomChatHistory:
         chat_histories[session_id] = CustomChatHistory()
     return chat_histories[session_id]
 
-# Define prompt template
+# LangChain setup
 prompt = ChatPromptTemplate.from_messages([
     ("system", "{system_prompt}"),
     MessagesPlaceholder(variable_name="history"),
     ("human", "{input}")
 ])
-
-# Create runnable with history
 chain = prompt | llm
 conversation = RunnableWithMessageHistory(
     runnable=chain,
@@ -162,8 +81,7 @@ conversation = RunnableWithMessageHistory(
     history_messages_key="history",
 )
 
-# ====== MODELS ======
-
+# Models
 class UserResponse(BaseModel):
     session_id: str
     answer: str
@@ -176,15 +94,61 @@ class StartInterviewRequest(BaseModel):
     session_id: str
     difficulty: str = "Medium"
 
-# ====== INTERVIEW LOGIC ======
+# Utility functions
+async def load_sessions():
+    global interview_sessions
+    try:
+        with open(SESSION_FILE, "rb") as f:
+            interview_sessions = pickle.load(f)
+        logger.info("Sessions loaded from file")
+    except FileNotFoundError:
+        interview_sessions = {}
+        logger.info("No session file found, starting with empty sessions")
+    except Exception as e:
+        logger.error(f"Error loading sessions: {e}")
+        interview_sessions = {}
 
+async def save_sessions():
+    try:
+        with open(SESSION_FILE, "wb") as f:
+            pickle.dump(interview_sessions, f)
+        logger.info("Sessions saved to file")
+    except Exception as e:
+        logger.error(f"Error saving sessions: {e}")
+
+def extract_text_from_pdf(file: BytesIO) -> str:
+    try:
+        doc = fitz.open(stream=file.read(), filetype="pdf")
+        text = ""
+        for page in doc[:10]:  # Limit to first 10 pages
+            text += page.get_text("text")
+        doc.close()
+        logger.info(f"Extracted {len(text)} characters from PDF")
+        return text.strip()
+    except Exception as e:
+        logger.error(f"Error extracting text from PDF: {e}")
+        raise HTTPException(status_code=400, detail="Failed to extract text from PDF")
+
+async def process_resume(file: BytesIO, session_id: str):
+    text = extract_text_from_pdf(file)
+    interview_sessions[session_id]["resume"] = text
+    await save_sessions()
+    logger.info(f"Processed resume for session {session_id}, text length: {len(text)}")
+
+async def cleanup_session(session_id: str):
+    await asyncio.sleep(300.0)  # Delay cleanup for 5 minutes
+    if session_id in interview_sessions and interview_sessions[session_id].get("ended", False):
+        del interview_sessions[session_id]
+        await save_sessions()
+        logger.info(f"Cleaned up session {session_id}")
+
+# Interview logic
 def run_interview(resume_text: str, chat_history: list, category: str = "general", difficulty: str = "Medium") -> str:
     difficulty_instruction = {
         "Easy": "Ask simple, beginner-friendly questions based on resume details.",
         "Medium": "Ask balanced, intermediate-level questions tied to resume specifics.",
         "Hard": "Ask challenging, in-depth questions directly related to resume content."
     }
-
     formatted_history = "\n".join([
         f"Interviewer: {turn.get('question', '')}\nCandidate: {turn.get('answer', '')}"
         for turn in chat_history
@@ -222,7 +186,7 @@ Instructions:
         logger.error(f"Error generating question: {e}")
         raise HTTPException(status_code=500, detail="Failed to generate question due to API error")
 
-def generate_feedback(chat_history: list) -> str:
+def generate_feedback(chat_history: List[dict]) -> str:
     if not chat_history:
         return "No interview data available for feedback"
     history = "\n".join([
@@ -255,12 +219,10 @@ Instructions:
         logger.error(f"Error generating feedback: {e}")
         raise HTTPException(status_code=500, detail="Failed to generate feedback due to API error")
 
-# ====== ROUTES ======
-
+# Routes
 @app.on_event("startup")
 async def startup_event():
     await load_sessions()
-
 
 @app.get("/status/{session_id}")
 async def get_status(session_id: str):
@@ -387,26 +349,17 @@ async def end_interview(request: EndInterviewRequest):
 
 @app.get("/get-feedback/{session_id}")
 async def get_feedback(session_id: str):
-    if USE_REDIS:
-        redis = await get_redis()
-        if redis:
-            try:
-                feedback = await redis.get(f"feedback_{session_id}")
-                if feedback:
-                    logger.info(f"Retrieved feedback for session {session_id} from Redis")
-                    return {"success": True, "feedback": feedback}
-            except Exception as e:
-                logger.error(f"Error retrieving feedback from Redis: {e}")
-    else:
-        try:
-            with open(f"feedback_{session_id}.txt", "r") as f:
-                feedback = f.read()
-            logger.info(f"Retrieved feedback for session {session_id} from file")
-            return {"success": True, "feedback": feedback}
-        except FileNotFoundError:
-            logger.error(f"Feedback file for session {session_id} not found")
-            pass
-    raise HTTPException(status_code=404, detail="Feedback not found")
+    try:
+        with open(f"/tmp/feedback_{session_id}.txt", "r") as f:
+            feedback = f.read()
+        logger.info(f"Retrieved feedback for session {session_id} from file")
+        return {"success": True, "feedback": feedback}
+    except FileNotFoundError:
+        logger.error(f"Feedback file for session {session_id} not found")
+        raise HTTPException(status_code=404, detail="Feedback not found")
+    except Exception as e:
+        logger.error(f"Error retrieving feedback: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve feedback")
 
 async def end_interview_internal(session_id: str):
     logger.info(f"Ending interview for session {session_id}")
@@ -423,16 +376,9 @@ async def end_interview_internal(session_id: str):
             feedback = "You have to complete the interview for 1 minute to receive feedback."
         else:
             feedback = generate_feedback(session["qa_history"])
-            # Save feedback persistently
-            if USE_REDIS:
-                redis = await get_redis()
-                if redis:
-                    await redis.setex(f"feedback_{session_id}", 24 * 60 * 60, feedback)  # 24-hour TTL
-                    logger.info(f"Saved feedback for session {session_id} to Redis")
-            else:
-                with open(f"feedback_{session_id}.txt", "w") as f:
-                    f.write(feedback)
-                logger.info(f"Saved feedback for session {session_id} to file")
+            with open(f"/tmp/feedback_{session_id}.txt", "w") as f:
+                f.write(feedback)
+            logger.info(f"Saved feedback for session {session_id} to file")
 
         result = {"success": True, "feedback": feedback, "end_interview": True}
         session["ended"] = True
@@ -444,13 +390,6 @@ async def end_interview_internal(session_id: str):
     except Exception as e:
         logger.error(f"Error ending interview {session_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
-
-async def cleanup_session(session_id: str):
-    await asyncio.sleep(300.0)  # Delay cleanup for 5 minutes
-    if session_id in interview_sessions and interview_sessions[session_id].get("ended", False):
-        del interview_sessions[session_id]
-        await save_sessions()
-        logger.info(f"Cleaned up session {session_id}")
 
 if __name__ == "__main__":
     import uvicorn
