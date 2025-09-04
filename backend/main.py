@@ -8,13 +8,11 @@ from typing import Dict, List
 from pydantic import BaseModel
 from langchain_openai import ChatOpenAI
 from langchain_core.runnables.history import RunnableWithMessageHistory
-from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from dotenv import load_dotenv
 import logging
 import asyncio
 import fitz  # PyMuPDF
-import redis.asyncio as aioredis
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -39,67 +37,10 @@ os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY", "your-openai-api-key-
 # Initialize LLM
 llm = ChatOpenAI(temperature=0.7, model_name="gpt-4o-mini")
 
-# Session storage
-SESSION_FILE = "interview_sessions.pkl"
+# Session storage (in-memory)
 interview_sessions: Dict[str, Dict] = {}
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
-USE_REDIS = True
 MIN_INTERVIEW_DURATION = 60  # 1 minute in seconds
-
-# Redis connection with retry
-async def get_redis():
-    try:
-        redis = await aioredis.from_url("redis://localhost:6379", encoding="utf-8", decode_responses=True)
-        await redis.ping()
-        logger.info("Connected to Redis successfully")
-        return redis
-    except Exception as e:
-        logger.error(f"Redis connection failed: {e}")
-        global USE_REDIS
-        USE_REDIS = False
-        return None
-
-async def load_sessions():
-    global interview_sessions
-    if USE_REDIS:
-        redis = await get_redis()
-        if redis:
-            try:
-                sessions = await redis.get("interview_sessions")
-                if sessions:
-                    interview_sessions = pickle.loads(sessions.encode())
-                logger.info("Sessions loaded from Redis")
-            except Exception as e:
-                logger.error(f"Error loading sessions from Redis: {e}")
-                interview_sessions = {}
-    else:
-        try:
-            with open(SESSION_FILE, "rb") as f:
-                interview_sessions = pickle.load(f)
-            logger.info("Sessions loaded from file")
-        except FileNotFoundError:
-            interview_sessions = {}
-            logger.info("No session file found, starting with empty sessions")
-        except Exception as e:
-            logger.error(f"Error loading sessions from file: {e}")
-            interview_sessions = {}
-
-async def save_sessions():
-    if USE_REDIS:
-        redis = await get_redis()
-        if redis:
-            try:
-                await redis.set("interview_sessions", pickle.dumps(interview_sessions))
-                logger.info("Sessions saved to Redis")
-            except Exception as e:
-                logger.error(f"Error saving sessions to Redis: {e}")
-    else:
-        try:
-            with open(SESSION_FILE, "wb") as f:
-                pickle.dump(interview_sessions, f)
-            logger.info("Sessions saved to file")
-        except Exception as e:
-            logger.error(f"Error saving sessions to file: {e}")
 
 def extract_text_from_pdf(file: BytesIO) -> str:
     try:
@@ -117,12 +58,10 @@ def extract_text_from_pdf(file: BytesIO) -> str:
 async def process_resume(file: BytesIO, session_id: str):
     text = extract_text_from_pdf(file)
     interview_sessions[session_id]["resume"] = text
-    await save_sessions()
     logger.info(f"Processed resume for session {session_id}, text length: {len(text)}")
 
 # ====== LangChain Setup ======
 
-# Custom in-memory chat history
 class CustomChatHistory:
     def __init__(self):
         self.messages = []
@@ -146,14 +85,12 @@ def get_session_history(session_id: str) -> CustomChatHistory:
         chat_histories[session_id] = CustomChatHistory()
     return chat_histories[session_id]
 
-# Define prompt template
 prompt = ChatPromptTemplate.from_messages([
     ("system", "{system_prompt}"),
     MessagesPlaceholder(variable_name="history"),
     ("human", "{input}")
 ])
 
-# Create runnable with history
 chain = prompt | llm
 conversation = RunnableWithMessageHistory(
     runnable=chain,
@@ -259,7 +196,9 @@ Instructions:
 
 @app.on_event("startup")
 async def startup_event():
-    await load_sessions()
+    global interview_sessions
+    interview_sessions = {}  # Initialize empty sessions on startup
+    logger.info("Initialized in-memory session storage")
 
 @app.get("/status/{session_id}")
 async def get_status(session_id: str):
@@ -294,7 +233,6 @@ async def upload_resume(resume: UploadFile = File(...), background_tasks: Backgr
     
     background_tasks.add_task(process_resume, BytesIO(contents), session_id)
     
-    await save_sessions()
     logger.info(f"Initiated resume upload for session {session_id}")
     return {"success": True, "session_id": session_id}
 
@@ -320,7 +258,6 @@ async def start_interview(request: StartInterviewRequest):
         question = run_interview(session["resume"], session["qa_history"], category, request.difficulty)
         session["qa_history"].append({"question": question, "type": category})
         session["question_count"][category] += 1
-        await save_sessions()
         logger.info(f"Started interview for session {request.session_id} with question: {question}")
         return {"success": True, "question": question, "session_id": request.session_id}
     except Exception as e:
@@ -348,13 +285,11 @@ async def submit_answer(request: UserResponse):
     if "answer" not in last_qa:
         last_qa["answer"] = request.answer
         session["qa_history"][-1] = last_qa
-    await save_sessions()
 
     if request.is_complete and request.answer:
         if len(request.answer.strip().split()) < 5:
             follow_up = "Could you provide more details or clarify your response?"
             session["qa_history"].append({"question": follow_up, "type": last_qa["type"]})
-            await save_sessions()
             logger.info(f"Requested clarification for session {request.session_id}")
             return {"success": True, "question": follow_up, "end_interview": False}
 
@@ -374,7 +309,6 @@ async def submit_answer(request: UserResponse):
         )
         session["qa_history"].append({"question": next_question, "type": next_category})
         session["question_count"][next_category] += 1
-        await save_sessions()
         logger.info(f"Submitted answer for {request.session_id}, next question: {next_question}")
         return {"success": True, "question": next_question, "end_interview": False}
 
@@ -386,26 +320,16 @@ async def end_interview(request: EndInterviewRequest):
 
 @app.get("/get-feedback/{session_id}")
 async def get_feedback(session_id: str):
-    if USE_REDIS:
-        redis = await get_redis()
-        if redis:
-            try:
-                feedback = await redis.get(f"feedback_{session_id}")
-                if feedback:
-                    logger.info(f"Retrieved feedback for session {session_id} from Redis")
-                    return {"success": True, "feedback": feedback}
-            except Exception as e:
-                logger.error(f"Error retrieving feedback from Redis: {e}")
-    else:
-        try:
-            with open(f"feedback_{session_id}.txt", "r") as f:
-                feedback = f.read()
-            logger.info(f"Retrieved feedback for session {session_id} from file")
-            return {"success": True, "feedback": feedback}
-        except FileNotFoundError:
-            logger.error(f"Feedback file for session {session_id} not found")
-            pass
-    raise HTTPException(status_code=404, detail="Feedback not found")
+    try:
+        session = interview_sessions.get(session_id)
+        if not session or not session.get("ended", False):
+            raise HTTPException(status_code=404, detail="Feedback not found or interview not ended")
+        feedback = generate_feedback(session["qa_history"])
+        logger.info(f"Retrieved feedback for session {session_id} from memory")
+        return {"success": True, "feedback": feedback}
+    except Exception as e:
+        logger.error(f"Error retrieving feedback: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve feedback")
 
 async def end_interview_internal(session_id: str):
     logger.info(f"Ending interview for session {session_id}")
@@ -422,20 +346,9 @@ async def end_interview_internal(session_id: str):
             feedback = "You have to complete the interview for 1 minute to receive feedback."
         else:
             feedback = generate_feedback(session["qa_history"])
-            # Save feedback persistently
-            if USE_REDIS:
-                redis = await get_redis()
-                if redis:
-                    await redis.setex(f"feedback_{session_id}", 24 * 60 * 60, feedback)  # 24-hour TTL
-                    logger.info(f"Saved feedback for session {session_id} to Redis")
-            else:
-                with open(f"feedback_{session_id}.txt", "w") as f:
-                    f.write(feedback)
-                logger.info(f"Saved feedback for session {session_id} to file")
 
         result = {"success": True, "feedback": feedback, "end_interview": True}
         session["ended"] = True
-        await save_sessions()
         logger.info(f"Ended interview for session {session_id}")
         loop = asyncio.get_event_loop()
         loop.create_task(cleanup_session(session_id))
@@ -448,9 +361,8 @@ async def cleanup_session(session_id: str):
     await asyncio.sleep(300.0)  # Delay cleanup for 5 minutes
     if session_id in interview_sessions and interview_sessions[session_id].get("ended", False):
         del interview_sessions[session_id]
-        await save_sessions()
         logger.info(f"Cleaned up session {session_id}")
 
-if __name__ == "_main_":
+if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

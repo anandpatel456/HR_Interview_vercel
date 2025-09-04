@@ -2,15 +2,9 @@ fastapi
 uvicorn
 python-multipart
 langchain
-groq
 pydantic
 openai
 PyMuPDF
-PyPDF2  # for PDF resume parsing
-protobuf==5.27.3
-streamlit-extras==0.7.5
-openai-whisper==20250625
 langchain_openai
 python-dotenv
-aioredis
-redis
+pyOpenSSL  # For potential TLS support if needed later

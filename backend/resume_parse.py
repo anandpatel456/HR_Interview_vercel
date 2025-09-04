@@ -1,8 +1,12 @@
-from PyPDF2 import PdfReader
+import fitz  # PyMuPDF
 
 def extract_text_from_pdf(pdf_file):
-    reader = PdfReader(pdf_file)
-    text = ""
-    for page in reader.pages:
-        text += page.extract_text() + "\n"
-    return text.strip()
+    try:
+        doc = fitz.open(stream=pdf_file.read(), filetype="pdf")
+        text = ""
+        for page in doc:
+            text += page.get_text("text") + "\n"
+        doc.close()
+        return text.strip()
+    except Exception as e:
+        raise Exception(f"Error extracting text from PDF: {e}")
