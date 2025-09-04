@@ -15,7 +15,7 @@ const ResumeUpload = () => {
   const location = useLocation();
   const difficulty = location.state?.difficulty || "Medium";
   const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB
-  const BACKEND_URL = "http://localhost:8000"; // Backend URL
+  const BACKEND_URL = "https://hr-interview-vercel.vercel.app"; // Backend URL
 
   // Compress PDF using pdf-lib
   const compressPDF = async (file) => {

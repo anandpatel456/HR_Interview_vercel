@@ -8,7 +8,7 @@ const GuidelineInterview = () => {
   const location = useLocation();
   const sessionId = location.state?.sessionId;
   const difficulty = location.state?.difficulty || "Medium";
-  const BACKEND_URL = "http://localhost:8000"; // Correct backend URL
+  const BACKEND_URL = "https://hr-interview-vercel.vercel.app"; // Correct backend URL
 
   const handleStart = async () => {
     if (!sessionId) {
