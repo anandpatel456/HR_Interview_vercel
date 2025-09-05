@@ -3,7 +3,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from io import BytesIO
 import os
 import time
-import pickle
 from typing import Dict, List
 from pydantic import BaseModel
 from langchain_openai import ChatOpenAI
@@ -25,7 +24,7 @@ app = FastAPI()
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Update to ["http://localhost:3000"] or Vercel frontend URL for production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -162,10 +161,12 @@ Instructions:
 def generate_feedback(chat_history: list) -> str:
     if not chat_history:
         return "No interview data available for feedback"
+    logger.info(f"Generating feedback with chat_history: {chat_history}")
     history = "\n".join([
         f"Interviewer: {turn.get('question', '')}\nCandidate: {turn.get('answer', '')}"
         for turn in chat_history if isinstance(turn, dict) and all(key in turn for key in ['question', 'answer'])
     ])
+    logger.info(f"Feedback transcript: {history}")
     system_prompt = f"""
 You are an HR expert providing a single, overall feedback summary after a mock interview.
 
@@ -178,7 +179,7 @@ Instructions:
    - Clarity: Overall clarity and structure of responses.
    - Depth: General depth and use of examples across answers.
 2. Identify overall strengths (e.g., clear communication, relevant examples) as a bullet list starting with "*Overall Strengths:*".
-3. Highlight overall areas for improvement (e.g., lack of detail, off-topic responses) as a bullet list starting with "*Areas for Improvement:*".
+3. Always highlight at least one area for improvement (e.g., lack of detail, off-topic responses) as a bullet list starting with "*Areas for Improvement:*", even if minor.
 4. Provide concise, actionable feedback in a friendly tone, starting with "Keep practicing".
 """.strip()
     try:
