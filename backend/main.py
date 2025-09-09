@@ -270,7 +270,6 @@ async def submit_answer(request: UserResponse):
     logger.info(f"Received submit-answer request for session_id: {request.session_id}")
     session = interview_sessions.get(request.session_id)
     if not session or session.get("ended", False):
-        logger.error(f"Session {request.session_id} not found or already ended")
         raise HTTPException(status_code=404, detail=f"Session {request.session_id} not found or already ended")
     
     elapsed_time = time.time() - session.get("start_time", time.time())
@@ -279,41 +278,51 @@ async def submit_answer(request: UserResponse):
         return await end_interview_internal(request.session_id)
 
     if not session["qa_history"]:
-        logger.error(f"No previous question for session {request.session_id}")
         raise HTTPException(status_code=400, detail="No previous question")
 
     last_qa = session["qa_history"][-1]
+
+    # ✅ Always append/overwrite the answer (partial or final)
     if "answer" not in last_qa:
         last_qa["answer"] = request.answer
-        session["qa_history"][-1] = last_qa
+    else:
+        # Append partial input instead of replacing
+        last_qa["answer"] += " " + request.answer
 
-    if request.is_complete and request.answer:
-        if len(request.answer.strip().split()) < 5:
-            follow_up = "Could you provide more details or clarify your response?"
-            session["qa_history"].append({"question": follow_up, "type": last_qa["type"]})
-            logger.info(f"Requested clarification for session {request.session_id}")
-            return {"success": True, "question": follow_up, "end_interview": False}
+    session["qa_history"][-1] = last_qa
 
-        current_type = last_qa["type"]
-        if session["phase"] == "general" and session["question_count"]["general"] < 3:
-            next_category = "general"
-        else:
-            if session["phase"] != "technical_projects":
-                session["phase"] = "technical_projects"
-            next_category = "technical" if last_qa["type"] == "projects" else "projects"
+    # ✅ If user is still speaking/typing (not complete), just acknowledge
+    if not request.is_complete:
+        logger.info(f"Partial answer received for {request.session_id}: {request.answer}")
+        return {"success": True, "message": "Answer noted, waiting for completion", "end_interview": False}
 
-        next_question = run_interview(
-            session["resume"], 
-            session["qa_history"], 
-            next_category, 
-            session.get("difficulty", "Medium")
-        )
-        session["qa_history"].append({"question": next_question, "type": next_category})
-        session["question_count"][next_category] += 1
-        logger.info(f"Submitted answer for {request.session_id}, next question: {next_question}")
-        return {"success": True, "question": next_question, "end_interview": False}
+    # ✅ If answer is complete, check length and move on
+    if len(request.answer.strip().split()) < 5:
+        follow_up = "Could you provide more details or clarify your response?"
+        session["qa_history"].append({"question": follow_up, "type": last_qa["type"]})
+        return {"success": True, "question": follow_up, "end_interview": False}
 
-    return {"success": True, "question": None, "end_interview": False}
+    # Decide next category
+    current_type = last_qa["type"]
+    if session["phase"] == "general" and session["question_count"]["general"] < 3:
+        next_category = "general"
+    else:
+        if session["phase"] != "technical_projects":
+            session["phase"] = "technical_projects"
+        next_category = "technical" if last_qa["type"] == "projects" else "projects"
+
+    # Generate next question
+    next_question = run_interview(
+        session["resume"], 
+        session["qa_history"], 
+        next_category, 
+        session.get("difficulty", "Medium")
+    )
+    session["qa_history"].append({"question": next_question, "type": next_category})
+    session["question_count"][next_category] += 1
+
+    return {"success": True, "question": next_question, "end_interview": False}
+
 
 @app.post("/end-interview")
 async def end_interview(request: EndInterviewRequest):
