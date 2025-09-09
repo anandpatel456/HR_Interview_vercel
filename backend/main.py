@@ -11,7 +11,7 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from dotenv import load_dotenv
 import logging
 import json
-from resume_parse import extract_text_from_pdf, parse_resume_to_json
+from resume_parse import extract_text_from_pdf
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -41,18 +41,17 @@ interview_sessions: Dict[str, Dict] = {}
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
 MIN_INTERVIEW_DURATION = 60  # 1 minute in seconds for feedback eligibility
 MAX_INTERVIEW_DURATION = 900  # 15 minutes in seconds
-INITIAL_GENERAL_QUESTIONS = 1  # Number of general questions to start
+INITIAL_GENERAL_QUESTIONS = 2  # Number of general questions to start
 SESSION_TTL = 3600  # 1 hour, for auto-cleanup
 
 async def process_resume(file: BytesIO, session_id: str):
     try:
         text = extract_text_from_pdf(file)
-        structured_resume = parse_resume_to_json(text)
-        interview_sessions[session_id]["resume"] = structured_resume
-        logger.info(f"Processed resume for session {session_id}, structured JSON: {json.dumps(structured_resume, indent=2)}")
+        interview_sessions[session_id]["resume"] = text  # Store as plain text
+        logger.info(f"Processed resume text for session {session_id}")
     except Exception as e:
         logger.error(f"Failed to process resume for session {session_id}: {e}")
-        interview_sessions[session_id]["resume"] = {}  # Fallback to empty resume
+        interview_sessions[session_id]["resume"] = ""  # Fallback to empty string
         interview_sessions[session_id]["error"] = str(e)
 
 # ====== LangChain Setup ======
@@ -107,33 +106,32 @@ class StartInterviewRequest(BaseModel):
     difficulty: str = "Medium"
 
 # ====== INTERVIEW LOGIC ======
-def run_interview(resume_data: Dict, chat_history: list, category: str = "general", difficulty: str = "Medium") -> str:
+def run_interview(resume_data: str, chat_history: list, category: str = "general", difficulty: str = "Medium") -> str:
     difficulty_instruction = {
-        "Easy": "Ask simple, beginner-friendly questions based on resume details.",
-        "Medium": "Ask balanced, intermediate-level questions tied to resume specifics.",
-        "Hard": "Ask challenging, in-depth questions directly related to resume content."
+        "Easy": "Ask simple, beginner-friendly questions based on resume text.",
+        "Medium": "Ask balanced, intermediate-level questions tied to resume text.",
+        "Hard": "Ask challenging, in-depth questions based on resume text."
     }
 
     formatted_history = "\n".join([
         f"Interviewer: {turn.get('question', '')}\nCandidate: {turn.get('answer', '')}\nEvaluation: {turn.get('evaluation', '')}"
         for turn in chat_history
     ])
-    resume_json = json.dumps(resume_data, indent=2)
     system_prompt = f"""
 You are a professional HR interviewer conducting a job interview. {difficulty_instruction.get(difficulty, '')}
 
-Resume (JSON):
-{resume_json}
+Resume (plain text):
+{resume_data}
 
 Past Conversation:
 {formatted_history}
 
 Instructions:
-1. Use the structured resume JSON to ask a single, concise question for the category: {category}.
-2. For 'general', ask about soft skills (e.g., teamwork, leadership) tied to experience or education.
-3. For 'technical', ask about specific skills or tools from the 'skills' section.
-4. For 'projects', ask about a specific project from the 'projects' section.
-5. Ensure the question is clear, relevant to the resume, and no longer than 20 words.
+1. Use the resume text to ask a single, concise question for the category: {category}.
+2. For 'general', ask about soft skills (e.g., teamwork, leadership) inferred from the text.
+3. For 'technical', ask about skills or tools mentioned in the text.
+4. For 'projects', ask about projects hinted at in the text.
+5. Ensure the question is clear, relevant, and no longer than 20 words.
 """.strip()
     try:
         response = conversation.invoke(
@@ -151,30 +149,29 @@ Instructions:
         logger.error(f"Error generating question: {e}")
         raise HTTPException(status_code=500, detail="Failed to generate question due to API error")
 
-def evaluate_answer(question: str, answer: str, resume_data: Dict, chat_history: list, category: str, difficulty: str) -> Dict:
-    difficulty_threshold = {"Easy": 2, "Medium": 3, "Hard": 4}  # Stricter for harder difficulties
+def evaluate_answer(question: str, answer: str, resume_data: str, chat_history: list, category: str, difficulty: str) -> Dict:
+    difficulty_threshold = {"Easy": 2, "Medium": 3, "Hard": 4}
     formatted_history = "\n".join([
         f"Interviewer: {turn.get('question', '')}\nCandidate: {turn.get('answer', '')}"
         for turn in chat_history
     ])
-    resume_json = json.dumps(resume_data, indent=2)
     system_prompt = f"""
 You are an HR expert evaluating a candidate's answer in a mock interview.
 
 Question: {question}
 Answer: {answer}
-Resume (JSON): {resume_json}
+Resume (plain text): {resume_data}
 Past Conversation: {formatted_history}
 Category: {category}
 
 Instructions:
 1. Score the answer on a 1-5 scale for:
-   - Relevance: Alignment with question, category, and resume details (e.g., specific skills, projects, or experiences).
-   - Quality: Clarity (structure and understandability), Depth (use of examples, details from resume), and Completeness (feels finished).
+   - Relevance: Alignment with question and resume text.
+   - Quality: Clarity, Depth, and Completeness.
    Overall score is the average (integer).
-2. If overall score < {difficulty_threshold.get(difficulty, 3)}, provide a polite, concise comment (1-2 sentences) explaining the issue (e.g., off-topic, lacking detail, incomplete) and suggest improvement.
-3. If score >= {difficulty_threshold.get(difficulty, 3)}, just say "Good answer."
-4. Output ONLY in JSON: {{"score": int, "comment": str}} where comment is empty if score is good.
+2. If overall score < {difficulty_threshold.get(difficulty, 3)}, provide a polite, concise comment and suggest improvement.
+3. If score >= {difficulty_threshold.get(difficulty, 3)}, say 'Good answer.'
+4. Output ONLY in JSON: {{"score": int, "comment": str}}.
 """.strip()
     try:
         response = conversation.invoke(
@@ -186,7 +183,7 @@ Instructions:
         return eval_result
     except Exception as e:
         logger.error(f"Error evaluating answer: {e}")
-        return {"score": 3, "comment": ""}  # Fallback to neutral
+        return {"score": 3, "comment": ""}
 
 def generate_feedback(chat_history: list) -> dict:
     if not chat_history:
@@ -211,11 +208,11 @@ Transcript:
 
 Instructions:
 1. Provide a JSON object with:
-   - summary: A 2-3 sentence overview of the candidate's performance (string).
-   - scores: Object with relevance, clarity, depth (integers, 1-10, based on evaluations in transcript).
-   - strengths: List of 1-3 specific strengths (e.g., clear communication, relevant examples).
-   - areas_for_improvement: List of 1-3 specific areas to improve (e.g., add technical details).
-   - actionable_advice: List of 1-3 specific, actionable suggestions (e.g., practice technical explanations).
+   - summary: A 2-3 sentence overview of the candidate's performance.
+   - scores: Object with relevance, clarity, depth (integers, 1-10).
+   - strengths: List of 1-3 specific strengths.
+   - areas_for_improvement: List of 1-3 specific areas to improve.
+   - actionable_advice: List of 1-3 specific, actionable suggestions.
 2. Base scores on evaluation scores in the transcript (average and scale to 1-10).
 3. Extract strengths and improvements from evaluations and transcript.
 4. Output ONLY valid JSON.
@@ -242,7 +239,7 @@ Instructions:
 @app.on_event("startup")
 async def startup_event():
     global interview_sessions
-    interview_sessions = {}  # Initialize empty sessions on startup
+    interview_sessions = {}
     logger.info("Initialized in-memory session storage")
 
 @app.get("/status/{session_id}")
@@ -266,7 +263,7 @@ async def upload_resume(resume: UploadFile = File(...)):
     
     session_id = str(time.time())
     interview_sessions[session_id] = {
-        "resume": {},  # Now a JSON dict
+        "resume": "",
         "qa_history": [],
         "start_time": None,
         "end_time": None,
@@ -274,11 +271,10 @@ async def upload_resume(resume: UploadFile = File(...)):
         "phase": "general",
         "ended": False,
         "difficulty": "Medium",
-        "created_at": time.time()  # For TTL
+        "created_at": time.time()
     }
     
     await process_resume(BytesIO(contents), session_id)
-    
     logger.info(f"Completed resume upload and processing for session {session_id}")
     return {"success": True, "session_id": session_id}
 
@@ -318,7 +314,6 @@ async def submit_answer(request: UserResponse):
         logger.error(f"Session {request.session_id} not found or already ended")
         raise HTTPException(status_code=404, detail=f"Session {request.session_id} not found or already ended")
     
-    # Check timeout
     elapsed_time = time.time() - session.get("start_time", time.time())
     if elapsed_time > MAX_INTERVIEW_DURATION:
         logger.info(f"Session {request.session_id} reached 15-minute duration, ending interview")
@@ -332,13 +327,11 @@ async def submit_answer(request: UserResponse):
     if "answer" not in last_qa:
         last_qa["answer"] = ""
     if not request.is_complete:
-        # Append to partial answer
         last_qa["answer"] += " " + request.answer.strip()
         session["qa_history"][-1] = last_qa
         logger.info(f"Appended partial answer for session {request.session_id}")
         return {"success": True, "question": None, "end_interview": False, "message": "Partial answer received; continue."}
     
-    # Complete answer: append final part and evaluate
     last_qa["answer"] += " " + request.answer.strip()
     full_answer = last_qa["answer"].strip()
     if len(full_answer.split()) < 5:
@@ -347,7 +340,6 @@ async def submit_answer(request: UserResponse):
         logger.info(f"Requested clarification for short answer in session {request.session_id}")
         return {"success": True, "question": follow_up, "end_interview": False, "message": "Answer too short."}
 
-    # Evaluate answer for relevance and quality
     eval_result = evaluate_answer(
         last_qa["question"], full_answer, session["resume"], session["qa_history"][:-1], 
         last_qa["type"], session["difficulty"]
@@ -356,13 +348,11 @@ async def submit_answer(request: UserResponse):
     session["qa_history"][-1] = last_qa
 
     if eval_result["score"] < {"Easy": 2, "Medium": 3, "Hard": 4}[session["difficulty"]]:
-        # Poor answer: provide comment and ask to re-answer or clarify
         follow_up = f"{eval_result['comment']} Please try answering again."
         session["qa_history"].append({"question": follow_up, "type": last_qa["type"]})
         logger.info(f"Poor answer evaluation for {request.session_id}; follow-up: {follow_up}")
         return {"success": True, "question": follow_up, "end_interview": False, "message": eval_result['comment']}
 
-    # Good answer: proceed to next
     current_type = last_qa["type"]
     if session["phase"] == "general" and session["question_count"]["general"] < INITIAL_GENERAL_QUESTIONS:
         next_category = "general"
@@ -377,7 +367,7 @@ async def submit_answer(request: UserResponse):
     session["qa_history"].append({"question": next_question, "type": next_category})
     session["question_count"][next_category] += 1
     logger.info(f"Good answer for {request.session_id}, next question: {next_question}")
-    return {"success": True, "question": next_question, "end_interview": False}
+    return {"success": True, "question": next_question, "end_interview": false}
 
 @app.post("/end-interview")
 async def end_interview(request: EndInterviewRequest):
@@ -429,7 +419,7 @@ async def end_interview_internal(session_id: str):
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 async def cleanup_session(session_id: str):
-    await asyncio.sleep(300.0)  # Delay cleanup for 5 minutes
+    await asyncio.sleep(300.0)
     if session_id in interview_sessions:
         if interview_sessions[session_id].get("ended", False) or (time.time() - interview_sessions[session_id]["created_at"] > SESSION_TTL):
             del interview_sessions[session_id]
