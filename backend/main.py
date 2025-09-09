@@ -25,7 +25,9 @@ app = FastAPI()
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Update to specific frontend URL in production
+    allow_origins=[
+        "http://localhost:3000",  # Allow local frontend during development  # Replace with your deployed frontend URL
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -42,7 +44,7 @@ interview_sessions: Dict[str, Dict] = {}
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
 MIN_INTERVIEW_DURATION = 60  # 1 minute in seconds for feedback eligibility
 MAX_INTERVIEW_DURATION = 900  # 15 minutes in seconds
-INITIAL_GENERAL_QUESTIONS = 1  # Number of general questions to ask at the start
+INITIAL_GENERAL_QUESTIONS = 2  # Number of general questions to start
 SESSION_TTL = 3600  # 1 hour, for auto-cleanup
 
 async def process_resume(file: BytesIO, session_id: str):
@@ -52,7 +54,6 @@ async def process_resume(file: BytesIO, session_id: str):
     logger.info(f"Processed resume for session {session_id}, structured JSON: {json.dumps(structured_resume, indent=2)}")
 
 # ====== LangChain Setup ======
-
 class CustomChatHistory:
     def __init__(self):
         self.messages = []
@@ -91,7 +92,6 @@ conversation = RunnableWithMessageHistory(
 )
 
 # ====== MODELS ======
-
 class UserResponse(BaseModel):
     session_id: str
     answer: str
@@ -105,7 +105,6 @@ class StartInterviewRequest(BaseModel):
     difficulty: str = "Medium"
 
 # ====== INTERVIEW LOGIC ======
-
 def run_interview(resume_data: Dict, chat_history: list, category: str = "general", difficulty: str = "Medium") -> str:
     difficulty_instruction = {
         "Easy": "Ask simple, beginner-friendly questions based on resume details.",
@@ -238,7 +237,6 @@ Instructions:
         }
 
 # ====== ROUTES ======
-
 @app.on_event("startup")
 async def startup_event():
     global interview_sessions
