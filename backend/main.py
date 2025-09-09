@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from io import BytesIO
 import os
@@ -10,7 +10,6 @@ from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from dotenv import load_dotenv
 import logging
-import asyncio
 import json
 from resume_parse import extract_text_from_pdf, parse_resume_to_json
 
@@ -25,9 +24,7 @@ app = FastAPI()
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",  # Allow local frontend during development  # Replace with your deployed frontend URL
-    ],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -44,14 +41,19 @@ interview_sessions: Dict[str, Dict] = {}
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
 MIN_INTERVIEW_DURATION = 60  # 1 minute in seconds for feedback eligibility
 MAX_INTERVIEW_DURATION = 900  # 15 minutes in seconds
-INITIAL_GENERAL_QUESTIONS = 2  # Number of general questions to start
+INITIAL_GENERAL_QUESTIONS = 1  # Number of general questions to start
 SESSION_TTL = 3600  # 1 hour, for auto-cleanup
 
 async def process_resume(file: BytesIO, session_id: str):
-    text = extract_text_from_pdf(file)
-    structured_resume = parse_resume_to_json(text)
-    interview_sessions[session_id]["resume"] = structured_resume
-    logger.info(f"Processed resume for session {session_id}, structured JSON: {json.dumps(structured_resume, indent=2)}")
+    try:
+        text = extract_text_from_pdf(file)
+        structured_resume = parse_resume_to_json(text)
+        interview_sessions[session_id]["resume"] = structured_resume
+        logger.info(f"Processed resume for session {session_id}, structured JSON: {json.dumps(structured_resume, indent=2)}")
+    except Exception as e:
+        logger.error(f"Failed to process resume for session {session_id}: {e}")
+        interview_sessions[session_id]["resume"] = {}  # Fallback to empty resume
+        interview_sessions[session_id]["error"] = str(e)
 
 # ====== LangChain Setup ======
 class CustomChatHistory:
@@ -252,7 +254,7 @@ async def get_status(session_id: str):
     return {"success": True, "resume_processed": bool(session["resume"])}
 
 @app.post("/upload-resume")
-async def upload_resume(resume: UploadFile = File(...), background_tasks: BackgroundTasks = None):
+async def upload_resume(resume: UploadFile = File(...)):
     if not resume.filename.endswith(".pdf"):
         logger.error("Upload failed: Only PDF files are supported")
         raise HTTPException(status_code=400, detail="Only PDF files are supported")
@@ -275,9 +277,9 @@ async def upload_resume(resume: UploadFile = File(...), background_tasks: Backgr
         "created_at": time.time()  # For TTL
     }
     
-    background_tasks.add_task(process_resume, BytesIO(contents), session_id)
+    await process_resume(BytesIO(contents), session_id)
     
-    logger.info(f"Initiated resume upload for session {session_id}")
+    logger.info(f"Completed resume upload and processing for session {session_id}")
     return {"success": True, "session_id": session_id}
 
 @app.post("/start-interview")
@@ -358,7 +360,7 @@ async def submit_answer(request: UserResponse):
         follow_up = f"{eval_result['comment']} Please try answering again."
         session["qa_history"].append({"question": follow_up, "type": last_qa["type"]})
         logger.info(f"Poor answer evaluation for {request.session_id}; follow-up: {follow_up}")
-        return {"success": True, "question": follow_up, "end_interview": False, "message": eval_result["comment"]}
+        return {"success": True, "question": follow_up, "end_interview": False, "message": eval_result['comment']}
 
     # Good answer: proceed to next
     current_type = last_qa["type"]
