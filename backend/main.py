@@ -40,25 +40,16 @@ llm = ChatOpenAI(temperature=0.7, model_name="gpt-4o-mini")
 interview_sessions: Dict[str, Dict] = {}
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
 MIN_INTERVIEW_DURATION = 60  # 1 minute in seconds
-SESSION_TTL = 3600  # 1 hour, for auto-cleanup
 
 def extract_text_from_pdf(file: BytesIO) -> str:
     try:
-        file.seek(0)  # Ensure stream is at start
         doc = fitz.open(stream=file.read(), filetype="pdf")
         text = ""
-        for page_num, page in enumerate(doc, 1):
-            page_text = page.get_text("text").strip()
-            if page_text:  # Skip empty pages
-                text += f"Page {page_num}:\n{page_text}\n\n"
+        for page in doc:
+            text += page.get_text("text")
         doc.close()
-        logger.info(f"Extracted {len(text)} characters from PDF with {len(doc)} pages")
-        if not text:
-            raise ValueError("PDF appears to be empty or unreadable")
+        logger.info(f"Extracted {len(text)} characters from PDF")
         return text.strip()
-    except fitz.FileDataError:
-        logger.error("PDF is encrypted or corrupted")
-        raise HTTPException(status_code=400, detail="PDF is encrypted or corrupted")
     except Exception as e:
         logger.error(f"Error extracting text from PDF: {e}")
         raise HTTPException(status_code=400, detail="Failed to extract text from PDF")
@@ -131,14 +122,14 @@ def run_interview(resume_text: str, chat_history: list, category: str = "general
     }
 
     formatted_history = "\n".join([
-        f"Interviewer: {turn.get('question', '')}\nCandidate: {turn.get('answer', '')}\nEvaluation: {turn.get('evaluation', '')}"
+        f"Interviewer: {turn.get('question', '')}\nCandidate: {turn.get('answer', '')}"
         for turn in chat_history
     ])
     system_prompt = f"""
 You are a professional HR interviewer conducting a job interview. {difficulty_instruction.get(difficulty, '')}
 
 Resume:
-\"\"\"{resume_text}\"\"\"
+\"\"\"{resume_text}\"\"
 
 Past Conversation:
 {formatted_history}
@@ -167,50 +158,13 @@ Instructions:
         logger.error(f"Error generating question: {e}")
         raise HTTPException(status_code=500, detail="Failed to generate question due to API error")
 
-def evaluate_answer(question: str, answer: str, resume_text: str, chat_history: list, category: str, difficulty: str) -> Dict:
-    difficulty_threshold = {"Easy": 2, "Medium": 3, "Hard": 4}  # Stricter for harder difficulties
-    formatted_history = "\n".join([
-        f"Interviewer: {turn.get('question', '')}\nCandidate: {turn.get('answer', '')}"
-        for turn in chat_history
-    ])
-    system_prompt = f"""
-You are an HR expert evaluating a candidate's answer in a mock interview.
-
-Question: {question}
-Answer: {answer}
-Resume: \"{resume_text}\"
-Past Conversation: {formatted_history}
-Category: {category}
-
-Instructions:
-1. Score the answer on a 1-5 scale for:
-   - Relevance: Alignment with question, category, and resume details.
-   - Quality: Clarity (structure and understandability), Depth (use of examples, details from resume), and Completeness (does it feel finished, not cut off).
-   Overall score is the average (integer).
-2. If overall score < {difficulty_threshold.get(difficulty, 3)}, provide a polite, concise comment (1-2 sentences) explaining the issue (e.g., off-topic, lacking detail, incomplete) and suggest improvement.
-3. If score >= {difficulty_threshold.get(difficulty, 3)}, just say "Good answer."
-4. Output ONLY in JSON: {{"score": int, "comment": str}} where comment is empty if score is good.
-""".strip()
-    try:
-        response = conversation.invoke(
-            {"input": "Evaluate the answer.", "system_prompt": system_prompt},
-            config={"configurable": {"session_id": "evaluation"}},
-        ).content.strip()
-        import json
-        eval_result = json.loads(response)
-        logger.info(f"Evaluated answer for question '{question}': score={eval_result['score']}, comment='{eval_result['comment']}'")
-        return eval_result
-    except Exception as e:
-        logger.error(f"Error evaluating answer: {e}")
-        return {"score": 3, "comment": ""}  # Fallback to neutral
-
 def generate_feedback(chat_history: list) -> str:
     if not chat_history:
         return "No interview data available for feedback"
     logger.info(f"Generating feedback with chat_history: {chat_history}")
     history = "\n".join([
-        f"Interviewer: {turn.get('question', '')}\nCandidate: {turn.get('answer', '')}\nEvaluation: {turn.get('evaluation', '')}"
-        for turn in chat_history if isinstance(turn, dict) and 'question' in turn and 'answer' in turn
+        f"Interviewer: {turn.get('question', '')}\nCandidate: {turn.get('answer', '')}"
+        for turn in chat_history if isinstance(turn, dict) and all(key in turn for key in ['question', 'answer'])
     ])
     logger.info(f"Feedback transcript: {history}")
     system_prompt = f"""
@@ -220,9 +174,10 @@ Transcript:
 {history}
 
 Instructions:
-1. Evaluate the overall performance based on all answers and evaluations for:
+1. Evaluate the overall performance based on all answers for:
    - Relevance: How well answers addressed questions and aligned with the resume.
-   - Quality: Clarity, depth, completeness of responses.
+   - Clarity: Overall clarity and structure of responses.
+   - Depth: General depth and use of examples across answers.
 2. Identify overall strengths (e.g., clear communication, relevant examples) as a bullet list starting with "*Overall Strengths:*".
 3. Always highlight at least one area for improvement (e.g., lack of detail, off-topic responses) as a bullet list starting with "*Areas for Improvement:*", even if minor.
 4. Provide concise, actionable feedback in a friendly tone, starting with "Keep practicing".
@@ -274,8 +229,7 @@ async def upload_resume(resume: UploadFile = File(...), background_tasks: Backgr
         "question_count": {"general": 0, "technical": 0, "projects": 0},
         "phase": "general",
         "ended": False,
-        "difficulty": "Medium",
-        "created_at": time.time()  # For TTL
+        "difficulty": "Medium"
     }
     
     background_tasks.add_task(process_resume, BytesIO(contents), session_id)
@@ -319,7 +273,6 @@ async def submit_answer(request: UserResponse):
         logger.error(f"Session {request.session_id} not found or already ended")
         raise HTTPException(status_code=404, detail=f"Session {request.session_id} not found or already ended")
     
-    # Check timeout
     elapsed_time = time.time() - session.get("start_time", time.time())
     if elapsed_time > 15 * 60:
         logger.info(f"Session {request.session_id} timed out, ending interview")
@@ -331,54 +284,36 @@ async def submit_answer(request: UserResponse):
 
     last_qa = session["qa_history"][-1]
     if "answer" not in last_qa:
-        last_qa["answer"] = ""
-    if not request.is_complete:
-        # Append to partial answer
-        last_qa["answer"] += " " + request.answer.strip()
+        last_qa["answer"] = request.answer
         session["qa_history"][-1] = last_qa
-        logger.info(f"Appended partial answer for session {request.session_id}")
-        return {"success": True, "question": None, "end_interview": False, "message": "Partial answer received; continue."}
-    
-    # Complete answer: append final part and evaluate
-    last_qa["answer"] += " " + request.answer.strip()
-    full_answer = last_qa["answer"].strip()
-    if len(full_answer.split()) < 5:
-        follow_up = "Could you provide more details or clarify your response?"
-        session["qa_history"].append({"question": follow_up, "type": last_qa["type"]})
-        logger.info(f"Requested clarification for short answer in session {request.session_id}")
-        return {"success": True, "question": follow_up, "end_interview": False, "message": "Answer too short."}
 
-    # Evaluate answer for relevance and quality
-    eval_result = evaluate_answer(
-        last_qa["question"], full_answer, session["resume"], session["qa_history"][:-1], 
-        last_qa["type"], session["difficulty"]
-    )
-    last_qa["evaluation"] = f"Score: {eval_result['score']}. {eval_result['comment']}"
-    session["qa_history"][-1] = last_qa
+    if request.is_complete and request.answer:
+        if len(request.answer.strip().split()) < 5:
+            follow_up = "Could you provide more details or clarify your response?"
+            session["qa_history"].append({"question": follow_up, "type": last_qa["type"]})
+            logger.info(f"Requested clarification for session {request.session_id}")
+            return {"success": True, "question": follow_up, "end_interview": False}
 
-    if eval_result["score"] < {"Easy": 2, "Medium": 3, "Hard": 4}[session["difficulty"]]:
-        # Poor answer: provide comment and ask to re-answer or clarify
-        follow_up = f"{eval_result['comment']} Please try answering again."
-        session["qa_history"].append({"question": follow_up, "type": last_qa["type"]})
-        logger.info(f"Poor answer evaluation for {request.session_id}; follow-up: {follow_up}")
-        return {"success": True, "question": follow_up, "end_interview": False, "message": eval_result["comment"]}
+        current_type = last_qa["type"]
+        if session["phase"] == "general" and session["question_count"]["general"] < 3:
+            next_category = "general"
+        else:
+            if session["phase"] != "technical_projects":
+                session["phase"] = "technical_projects"
+            next_category = "technical" if last_qa["type"] == "projects" else "projects"
 
-    # Good answer: proceed to next
-    current_type = last_qa["type"]
-    if session["question_count"]["general"] < 1:
-        next_category = "general"
-    else:
-        if session["phase"] != "technical_projects":
-            session["phase"] = "technical_projects"
-        next_category = "technical" if current_type == "projects" else "projects"
+        next_question = run_interview(
+            session["resume"], 
+            session["qa_history"], 
+            next_category, 
+            session.get("difficulty", "Medium")
+        )
+        session["qa_history"].append({"question": next_question, "type": next_category})
+        session["question_count"][next_category] += 1
+        logger.info(f"Submitted answer for {request.session_id}, next question: {next_question}")
+        return {"success": True, "question": next_question, "end_interview": False}
 
-    next_question = run_interview(
-        session["resume"], session["qa_history"], next_category, session["difficulty"]
-    )
-    session["qa_history"].append({"question": next_question, "type": next_category})
-    session["question_count"][next_category] += 1
-    logger.info(f"Good answer for {request.session_id}, next question: {next_question}")
-    return {"success": True, "question": next_question, "end_interview": False}
+    return {"success": True, "question": None, "end_interview": False}
 
 @app.post("/end-interview")
 async def end_interview(request: EndInterviewRequest):
@@ -425,12 +360,9 @@ async def end_interview_internal(session_id: str):
 
 async def cleanup_session(session_id: str):
     await asyncio.sleep(300.0)  # Delay cleanup for 5 minutes
-    if session_id in interview_sessions:
-        if interview_sessions[session_id].get("ended", False) or (time.time() - interview_sessions[session_id]["created_at"] > SESSION_TTL):
-            del interview_sessions[session_id]
-            if session_id in chat_histories:
-                del chat_histories[session_id]
-            logger.info(f"Cleaned up session {session_id}")
+    if session_id in interview_sessions and interview_sessions[session_id].get("ended", False):
+        del interview_sessions[session_id]
+        logger.info(f"Cleaned up session {session_id}")
 
 if __name__ == "__main__":
     import uvicorn
