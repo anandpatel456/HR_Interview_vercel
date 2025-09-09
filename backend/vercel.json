@@ -3,25 +3,13 @@
   "builds": [
     {
       "src": "main.py",
-      "use": "@vercel/python",
-      "config": {
-        "maxLambdaSize": "50mb",
-        "timeout": 30
-      }
+      "use": "@vercel/python"
     }
   ],
   "routes": [
     {
       "src": "/(.*)",
-      "dest": "main.py",
-      "headers": {
-        "Access-Control-Allow-Origin": "http://localhost:3000",
-        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-        "Access-Control-Allow-Headers": "*"
-      }
+      "dest": "main.py"
     }
-  ],
-  "env": {
-    "OPENAI_API_KEY": "@openai-api-key"
-  }
+  ]
 }
