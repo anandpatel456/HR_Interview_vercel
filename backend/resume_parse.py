@@ -1,12 +1,24 @@
 import fitz  # PyMuPDF
+from io import BytesIO
+import logging
+from fastapi import FastAPI, HTTPException, UploadFile, File
 
-def extract_text_from_pdf(pdf_file):
+# Setup logger
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
+def extract_text_from_pdf(file: BytesIO) -> str:
     try:
-        doc = fitz.open(stream=pdf_file.read(), filetype="pdf")
+        file.seek(0)  # Reset stream position
+        doc = fitz.open(stream=file.read(), filetype="pdf")
         text = ""
         for page in doc:
-            text += page.get_text("text") + "\n"
+            page_text = page.get_text("text").strip()
+            if page_text:  # Skip empty pages
+                text += page_text + "\n\n"  # Double newline for page separation
         doc.close()
+        logger.info(f"Extracted {len(text)} characters from PDF")
         return text.strip()
     except Exception as e:
-        raise Exception(f"Error extracting text from PDF: {e}")
+        logger.error(f"Error extracting text from PDF: {e}")
+        raise HTTPException(status_code=400, detail="Failed to extract text from PDF")
