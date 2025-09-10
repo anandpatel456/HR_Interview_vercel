@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 import logging
 import asyncio
 import fitz  # PyMuPDF
+import json
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -40,6 +41,8 @@ llm = ChatOpenAI(temperature=0.7, model_name="gpt-4o-mini")
 interview_sessions: Dict[str, Dict] = {}
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
 MIN_INTERVIEW_DURATION = 60  # 1 minute in seconds
+MAX_IRRELEVANT_RETRIES = 2  # Maximum retries for irrelevant answers
+DEBOUNCE_DELAY = 3.0  # Seconds to wait for additional input before processing partial answer
 
 def extract_text_from_pdf(file: BytesIO) -> str:
     try:
@@ -129,7 +132,7 @@ def run_interview(resume_text: str, chat_history: list, category: str = "general
 You are a professional HR interviewer conducting a job interview. {difficulty_instruction.get(difficulty, '')}
 
 Resume:
-\"\"\"{resume_text}\"\"\"
+\"\"\"{resume_text}\"\"
 
 Past Conversation:
 {formatted_history}
@@ -166,7 +169,7 @@ def generate_feedback(chat_history: list) -> str:
         f"Interviewer: {turn.get('question', '')}\nCandidate: {turn.get('answer', '')}"
         for turn in chat_history if isinstance(turn, dict) and all(key in turn for key in ['question', 'answer'])
     ])
-    logger.info(f"Feedback transcript: {history}")
+    irrelevant_count = sum(1 for turn in chat_history if turn.get('question', '').startswith("Your answer seems unrelated"))
     system_prompt = f"""
 You are an HR expert providing a single, overall feedback summary after a mock interview.
 
@@ -178,9 +181,10 @@ Instructions:
    - Relevance: How well answers addressed questions and aligned with the resume.
    - Clarity: Overall clarity and structure of responses.
    - Depth: General depth and use of examples across answers.
-2. Identify overall strengths (e.g., clear communication, relevant examples) as a bullet list starting with "Overall Strengths:".
-3. Always highlight at least one area for improvement (e.g., lack of detail, off-topic responses) as a bullet list starting with "Areas for Improvement:", even if minor.
-4. Provide concise, actionable feedback in a friendly tone, starting with "Keep practicing".
+2. Note that {irrelevant_count} answer(s) were flagged as irrelevant.
+3. Identify overall strengths (e.g., clear communication, relevant examples) as a bullet list starting with "Overall Strengths:".
+4. Always highlight at least one area for improvement (e.g., lack of detail, off-topic responses, or frequent irrelevant answers) as a bullet list starting with "Areas for Improvement:".
+5. Provide concise, actionable feedback in a friendly tone, starting with "Keep practicing".
 """.strip()
     try:
         feedback = conversation.invoke(
@@ -219,7 +223,6 @@ Example:
             {"input": "Evaluate the relevance of the answer.", "system_prompt": system_prompt},
             config={"configurable": {"session_id": "relevance_check"}},
         ).content.strip()
-        import json
         result = json.loads(response)
         logger.info(f"Relevance check result for question '{question}': {result}")
         return result.get("is_relevant", True), result.get("reason", "")
@@ -263,7 +266,9 @@ async def upload_resume(resume: UploadFile = File(...), background_tasks: Backgr
         "question_count": {"general": 0, "technical": 0, "projects": 0},
         "phase": "general",
         "ended": False,
-        "difficulty": "Medium"
+        "difficulty": "Medium",
+        "irrelevant_retries": 0,
+        "last_partial_timestamp": None  # Track last partial answer time
     }
     
     background_tasks.add_task(process_resume, BytesIO(contents), session_id)
@@ -287,6 +292,8 @@ async def start_interview(request: StartInterviewRequest):
     
     session["difficulty"] = request.difficulty
     session["start_time"] = time.time()
+    session["irrelevant_retries"] = 0
+    session["last_partial_timestamp"] = None  # Reset on start
     category = "general"
 
     try:
@@ -299,8 +306,82 @@ async def start_interview(request: StartInterviewRequest):
         logger.error(f"Failed to start interview for session {request.session_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to start interview: {str(e)}")
 
+async def process_complete_answer(session_id: str, last_answer: str, last_qa: dict, current_type: str):
+    session = interview_sessions.get(session_id)
+    if not session:
+        logger.error(f"Session {session_id} not found during answer processing")
+        return
+
+    # Check if answer meets minimum length requirement
+    if len(last_answer.strip().split()) < 5:
+        follow_up = "Could you provide more details or clarify your response?"
+        session["qa_history"].append({"question": follow_up, "type": current_type})
+        session["irrelevant_retries"] = 0  # Reset retries for length-related follow-up
+        logger.info(f"Short answer detected for session {session_id}: {last_answer}")
+        return {"success": True, "question": follow_up, "end_interview": False}
+
+    # Check answer relevance
+    is_relevant, reason = check_answer_relevance(
+        question=last_qa["question"],
+        answer=last_answer,
+        resume_text=session["resume"],
+        category=current_type
+    )
+
+    if not is_relevant:
+        session["irrelevant_retries"] = session.get("irrelevant_retries", 0) + 1
+        if session["irrelevant_retries"] >= MAX_IRRELEVANT_RETRIES:
+            follow_up = "Please focus on the question. Let's move to the next one."
+            session["irrelevant_retries"] = 0  # Reset retries
+            # Proceed to next question
+            if session["phase"] == "general" and session["question_count"]["general"] < 3:
+                next_category = "general"
+            else:
+                if session["phase"] != "technical_projects":
+                    session["phase"] = "technical_projects"
+                next_category = "technical" if current_type == "projects" else "projects"
+            next_question = run_interview(
+                session["resume"],
+                session["qa_history"],
+                next_category,
+                session.get("difficulty", "Medium")
+            )
+            session["qa_history"].append({"question": follow_up, "type": current_type})
+            session["qa_history"].append({"question": next_question, "type": next_category})
+            session["question_count"][next_category] += 1
+            logger.info(f"Max irrelevant retries reached for session {session_id}. Moving to next question: {next_question}")
+            return {"success": True, "question": next_question, "end_interview": False}
+        else:
+            follow_up = f"Your answer seems unrelated: {reason} Please provide a relevant response."
+            session["qa_history"].append({"question": follow_up, "type": current_type})
+            logger.info(f"Irrelevant answer detected for session {session_id}: {reason}")
+            return {"success": True, "question": follow_up, "end_interview": False}
+
+    # Reset retries if answer is relevant
+    session["irrelevant_retries"] = 0
+
+    # Decide next category
+    if session["phase"] == "general" and session["question_count"]["general"] < 3:
+        next_category = "general"
+    else:
+        if session["phase"] != "technical_projects":
+            session["phase"] = "technical_projects"
+        next_category = "technical" if current_type == "projects" else "projects"
+
+    # Generate next question
+    next_question = run_interview(
+        session["resume"],
+        session["qa_history"],
+        next_category,
+        session.get("difficulty", "Medium")
+    )
+    session["qa_history"].append({"question": next_question, "type": next_category})
+    session["question_count"][next_category] += 1
+
+    return {"success": True, "question": next_question, "end_interview": False}
+
 @app.post("/submit-answer")
-async def submit_answer(request: UserResponse):
+async def submit_answer(request: UserResponse, background_tasks: BackgroundTasks):
     logger.info(f"Received submit-answer request for session_id: {request.session_id}")
     session = interview_sessions.get(request.session_id)
     if not session or session.get("ended", False):
@@ -316,7 +397,7 @@ async def submit_answer(request: UserResponse):
 
     last_qa = session["qa_history"][-1]
 
-    # Append/overwrite the answer (partial or final)
+    # Append/overwrite the answer
     if "answer" not in last_qa:
         last_qa["answer"] = request.answer
     else:
@@ -324,51 +405,45 @@ async def submit_answer(request: UserResponse):
 
     session["qa_history"][-1] = last_qa
 
-    # If user is still speaking/typing (not complete), just acknowledge
-    if not request.is_complete:
-        logger.info(f"Partial answer received for {request.session_id}: {request.answer}")
-        return {"success": True, "message": "Answer noted, waiting for completion", "end_interview": False}
+    # If answer is marked as complete, process immediately
+    if request.is_complete:
+        session["last_partial_timestamp"] = None  # Clear timestamp
+        return await process_complete_answer(
+            session_id=request.session_id,
+            last_answer=last_qa["answer"],
+            last_qa=last_qa,
+            current_type=last_qa["type"]
+        )
 
-    # Check if answer meets minimum length requirement
-    if len(request.answer.strip().split()) < 5:
-        follow_up = "Could you provide more details or clarify your response?"
-        session["qa_history"].append({"question": follow_up, "type": last_qa["type"]})
-        return {"success": True, "question": follow_up, "end_interview": False}
+    # Handle partial answer
+    current_time = time.time()
+    session["last_partial_timestamp"] = current_time
+    last_answer = last_qa["answer"]
 
-    # Check answer relevance
-    is_relevant, reason = check_answer_relevance(
-        question=last_qa["question"],
-        answer=last_qa["answer"],
-        resume_text=session["resume"],
-        category=last_qa["type"]
-    )
+    logger.info(f"Partial answer received for session {request.session_id}: {request.answer}")
 
-    if not is_relevant:
-        follow_up = f"Your answer seems unrelated: {reason} Please provide a relevant response."
-        session["qa_history"].append({"question": follow_up, "type": last_qa["type"]})
-        logger.info(f"Irrelevant answer detected for session {request.session_id}: {reason}")
-        return {"success": True, "question": follow_up, "end_interview": False}
+    # Schedule a task to check if the answer is complete after debounce delay
+    async def check_answer_completion():
+        await asyncio.sleep(DEBOUNCE_DELAY)
+        if session_id not in interview_sessions or session.get("ended", False):
+            return
+        # Check if no new partial answer was received (same timestamp)
+        if session.get("last_partial_timestamp") == current_time:
+            logger.info(f"Debounce period expired for session {session_id}, processing answer: {last_answer}")
+            result = await process_complete_answer(
+                session_id=session_id,
+                last_answer=last_answer,
+                last_qa=last_qa,
+                current_type=last_qa["type"]
+            )
+            # Note: Since this runs in the background, the result is not returned to the client
+            # You may need to notify the client via WebSocket or polling
+        else:
+            logger.info(f"New partial answer received for session {session_id} during debounce period")
 
-    # Decide next category
-    current_type = last_qa["type"]
-    if session["phase"] == "general" and session["question_count"]["general"] < 3:
-        next_category = "general"
-    else:
-        if session["phase"] != "technical_projects":
-            session["phase"] = "technical_projects"
-        next_category = "technical" if last_qa["type"] == "projects" else "projects"
-
-    # Generate next question
-    next_question = run_interview(
-        session["resume"], 
-        session["qa_history"], 
-        next_category, 
-        session.get("difficulty", "Medium")
-    )
-    session["qa_history"].append({"question": next_question, "type": next_category})
-    session["question_count"][next_category] += 1
-
-    return {"success": True, "question": next_question, "end_interview": False}
+    session_id = request.session_id
+    background_tasks.add_task(check_answer_completion)
+    return {"success": True, "message": f"Partial answer noted, waiting {DEBOUNCE_DELAY} seconds for completion", "end_interview": False}
 
 @app.post("/end-interview")
 async def end_interview(request: EndInterviewRequest):
