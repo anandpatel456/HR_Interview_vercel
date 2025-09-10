@@ -42,7 +42,7 @@ interview_sessions: Dict[str, Dict] = {}
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
 MIN_INTERVIEW_DURATION = 60  # 1 minute in seconds for feedback eligibility
 MAX_IRRELEVANT_RETRIES = 2  # Maximum retries for irrelevant answers
-DEBOUNCE_DELAY = 3.0  # Seconds to wait for additional input
+DEBOUNCE_DELAY = 3.0  # Seconds to wait for additional input before processing partial answer
 INTERVIEW_DURATION = 15 * 60  # 15 minutes in seconds
 
 def extract_text_from_pdf(file: BytesIO) -> str:
@@ -200,22 +200,20 @@ Instructions:
         raise HTTPException(status_code=500, detail="Failed to generate feedback due to API error")
 
 def check_answer_alignment(question: str, answer: str, resume_text: str, category: str) -> tuple[str, str]:
-    """
-    Only mark answer as 'strongly_irrelevant' if it is completely off-topic.
-    All on-topic answers, even vague or incomplete, are considered 'strongly_relevant'.
-    """
     system_prompt = f"""
 You are an HR interviewer evaluating if a candidate's answer is aligned with the question.
-
-Instructions:
-- Only flag answers as irrelevant if they are completely off-topic and unrelated to the question or resume.
-- Examples of off-topic: talking about cooking when asked about Python, or sports when asked about AI project.
-- Vague, incomplete, or poorly phrased answers are considered strongly relevant.
+Be extremely lenient. Only flag answers as irrelevant if they are completely off-topic and unrelated to the question or resume (e.g., discussing cooking when asked about a coding project).
 
 Question: {question}
 Answer: {answer}
-Resume: "{resume_text}"
+Resume: \"{resume_text}\"
 Category: {category}
+
+Instructions:
+1. If the answer has no connection to the question or resume (e.g., unrelated topics like cooking or sports),
+   classify as "strongly_irrelevant" with reason: "I didn’t get your answer".
+2. If the answer mentions the topic, project, or role from the question/resume (even vaguely), classify as "strongly_relevant" with empty reason.
+3. Do not penalize for lack of detail or clarity—focus solely on topical relevance.
 
 Return a JSON object:
 {{ "alignment": "strongly_relevant|strongly_irrelevant", "reason": "<short reason>" }}
@@ -227,7 +225,6 @@ Return a JSON object:
             config={"configurable": {"session_id": "alignment_check"}},
         ).content.strip()
         result = json.loads(response)
-        # Default to strongly_relevant if unclear
         return result.get("alignment", "strongly_relevant"), result.get("reason", "")
     except Exception as e:
         logger.error(f"Error checking answer alignment: {e}")
@@ -279,7 +276,7 @@ async def process_complete_answer(session_id: str, last_answer: str, last_qa: di
             logger.info(f"Strongly irrelevant answer detected for session {session_id}, retries remaining: {MAX_IRRELEVANT_RETRIES - session['irrelevant_retries']}")
             return {"success": True, "question": follow_up, "message": follow_up, "speak_only": True, "end_interview": False}
     else:
-        # Relevant answer: reset retries and move to next question
+        # Reset retries and proceed to next question if relevant (even if vague)
         session["irrelevant_retries"] = 0
         logger.info(f"Reset irrelevant retries for session {session_id} due to relevant answer (alignment: {alignment})")
         current_count = session["question_count"].get("general", 0)
