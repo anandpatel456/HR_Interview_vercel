@@ -200,9 +200,13 @@ Instructions:
         raise HTTPException(status_code=500, detail="Failed to generate feedback due to API error")
 
 def check_answer_alignment(question: str, answer: str, resume_text: str, category: str) -> tuple[str, str]:
+    """
+    Only mark answer as 'strongly_irrelevant' if it is completely off-topic.
+    All on-topic answers, even vague or incomplete, are considered 'strongly_relevant'.
+    """
     system_prompt = f"""
 You are an HR interviewer evaluating if a candidate's answer is aligned with the question.
-Be extremely lenient. Only flag answers as irrelevant if they are completely off-topic and unrelated to the question or resume (e.g., discussing cooking when asked about a coding project).
+Be extremely lenient. Only flag answers as irrelevant if they are completely off-topic and have no relation to the question, resume, or category.
 
 Question: {question}
 Answer: {answer}
@@ -210,22 +214,24 @@ Resume: \"{resume_text}\"
 Category: {category}
 
 Instructions:
-1. If the answer has no connection to the question or resume (e.g., unrelated topics like cooking or sports),
-   classify as "strongly_irrelevant" with reason: "I didn’t get your answer".
-2. If the answer mentions the topic, project, or role from the question/resume (even vaguely), classify as "strongly_relevant" with empty reason.
-3. Do not penalize for lack of detail or clarity—focus solely on topical relevance.
+1. Flag as 'strongly_irrelevant' only if the answer discusses unrelated topics (e.g., cooking, sports) with no connection to the question or resume.
+2. Consider any answer mentioning the topic, project, role, or resume details (even vaguely or incompletely) as 'strongly_relevant'.
+3. Ignore lack of detail, clarity, or grammar—focus solely on topical relevance.
+4. Return a JSON object: {{ "alignment": "strongly_relevant|strongly_irrelevant", "reason": "<short reason>" }}.
 
-Return a JSON object:
-{{ "alignment": "strongly_relevant|strongly_irrelevant", "reason": "<short reason>" }}
-""".strip()
-
+Debug: Log the raw response before parsing to ensure correct format.
+"""
     try:
         response = conversation.invoke(
             {"input": "Evaluate answer relevance.", "system_prompt": system_prompt},
             config={"configurable": {"session_id": "alignment_check"}},
         ).content.strip()
+        logger.debug(f"Raw alignment response for question '{question}', answer '{answer}': {response}")
         result = json.loads(response)
         return result.get("alignment", "strongly_relevant"), result.get("reason", "")
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON parsing error in alignment check: {e}, raw response: {response}")
+        return "strongly_relevant", ""
     except Exception as e:
         logger.error(f"Error checking answer alignment: {e}")
         return "strongly_relevant", ""
@@ -276,7 +282,7 @@ async def process_complete_answer(session_id: str, last_answer: str, last_qa: di
             logger.info(f"Strongly irrelevant answer detected for session {session_id}, retries remaining: {MAX_IRRELEVANT_RETRIES - session['irrelevant_retries']}")
             return {"success": True, "question": follow_up, "message": follow_up, "speak_only": True, "end_interview": False}
     else:
-        # Reset retries and proceed to next question if relevant (even if vague)
+        # Relevant answer: reset retries and move to next question
         session["irrelevant_retries"] = 0
         logger.info(f"Reset irrelevant retries for session {session_id} due to relevant answer (alignment: {alignment})")
         current_count = session["question_count"].get("general", 0)
