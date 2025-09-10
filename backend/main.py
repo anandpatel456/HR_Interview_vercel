@@ -129,7 +129,7 @@ def run_interview(resume_text: str, chat_history: list, category: str = "general
 You are a professional HR interviewer conducting a job interview. {difficulty_instruction.get(difficulty, '')}
 
 Resume:
-\"\"\"{resume_text}\"\"
+\"\"\"{resume_text}\"\"\"
 
 Past Conversation:
 {formatted_history}
@@ -178,8 +178,8 @@ Instructions:
    - Relevance: How well answers addressed questions and aligned with the resume.
    - Clarity: Overall clarity and structure of responses.
    - Depth: General depth and use of examples across answers.
-2. Identify overall strengths (e.g., clear communication, relevant examples) as a bullet list starting with "*Overall Strengths:*".
-3. Always highlight at least one area for improvement (e.g., lack of detail, off-topic responses) as a bullet list starting with "*Areas for Improvement:*", even if minor.
+2. Identify overall strengths (e.g., clear communication, relevant examples) as a bullet list starting with "Overall Strengths:".
+3. Always highlight at least one area for improvement (e.g., lack of detail, off-topic responses) as a bullet list starting with "Areas for Improvement:", even if minor.
 4. Provide concise, actionable feedback in a friendly tone, starting with "Keep practicing".
 """.strip()
     try:
@@ -192,6 +192,40 @@ Instructions:
     except Exception as e:
         logger.error(f"Error generating feedback: {e}")
         raise HTTPException(status_code=500, detail="Failed to generate feedback due to API error")
+
+def check_answer_relevance(question: str, answer: str, resume_text: str, category: str) -> tuple[bool, str]:
+    system_prompt = f"""
+You are an HR expert evaluating the relevance of a candidate's answer to a mock interview question.
+
+Question: {question}
+Answer: {answer}
+Resume: \"{resume_text}\"
+Category: {category}
+
+Instructions:
+1. Determine if the answer is relevant to the question and aligns with the resume or category ({category}).
+2. An answer is relevant if it addresses the question directly and relates to the resume or category.
+3. If the answer is unrelated (e.g., discussing unrelated topics like cooking when asked about a project), mark it as irrelevant.
+4. Provide a concise reason (max 20 words) for irrelevance if applicable.
+5. Return a JSON object with 'is_relevant' (boolean) and 'reason' (string, empty if relevant).
+
+Example:
+- Question: "Describe your experience with Python projects."
+- Answer: "I am cooking tonight."
+- Result: {{ "is_relevant": false, "reason": "Answer discusses cooking, unrelated to Python projects." }}
+""".strip()
+    try:
+        response = conversation.invoke(
+            {"input": "Evaluate the relevance of the answer.", "system_prompt": system_prompt},
+            config={"configurable": {"session_id": "relevance_check"}},
+        ).content.strip()
+        import json
+        result = json.loads(response)
+        logger.info(f"Relevance check result for question '{question}': {result}")
+        return result.get("is_relevant", True), result.get("reason", "")
+    except Exception as e:
+        logger.error(f"Error checking answer relevance: {e}")
+        return True, ""  # Default to assuming relevance on error to avoid blocking flow
 
 # ====== ROUTES ======
 
@@ -282,24 +316,37 @@ async def submit_answer(request: UserResponse):
 
     last_qa = session["qa_history"][-1]
 
-    # ✅ Always append/overwrite the answer (partial or final)
+    # Append/overwrite the answer (partial or final)
     if "answer" not in last_qa:
         last_qa["answer"] = request.answer
     else:
-        # Append partial input instead of replacing
         last_qa["answer"] += " " + request.answer
 
     session["qa_history"][-1] = last_qa
 
-    # ✅ If user is still speaking/typing (not complete), just acknowledge
+    # If user is still speaking/typing (not complete), just acknowledge
     if not request.is_complete:
         logger.info(f"Partial answer received for {request.session_id}: {request.answer}")
         return {"success": True, "message": "Answer noted, waiting for completion", "end_interview": False}
 
-    # ✅ If answer is complete, check length and move on
+    # Check if answer meets minimum length requirement
     if len(request.answer.strip().split()) < 5:
         follow_up = "Could you provide more details or clarify your response?"
         session["qa_history"].append({"question": follow_up, "type": last_qa["type"]})
+        return {"success": True, "question": follow_up, "end_interview": False}
+
+    # Check answer relevance
+    is_relevant, reason = check_answer_relevance(
+        question=last_qa["question"],
+        answer=last_qa["answer"],
+        resume_text=session["resume"],
+        category=last_qa["type"]
+    )
+
+    if not is_relevant:
+        follow_up = f"Your answer seems unrelated: {reason} Please provide a relevant response."
+        session["qa_history"].append({"question": follow_up, "type": last_qa["type"]})
+        logger.info(f"Irrelevant answer detected for session {request.session_id}: {reason}")
         return {"success": True, "question": follow_up, "end_interview": False}
 
     # Decide next category
@@ -322,7 +369,6 @@ async def submit_answer(request: UserResponse):
     session["question_count"][next_category] += 1
 
     return {"success": True, "question": next_question, "end_interview": False}
-
 
 @app.post("/end-interview")
 async def end_interview(request: EndInterviewRequest):
