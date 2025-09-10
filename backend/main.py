@@ -25,7 +25,7 @@ app = FastAPI()
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Update to specific origin (e.g., Vercel URL) in production
+    allow_origins=["*"],  # Update to specific origin in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -202,7 +202,7 @@ Instructions:
 def check_answer_alignment(question: str, answer: str, resume_text: str, category: str) -> tuple[str, str]:
     system_prompt = f"""
 You are an HR interviewer evaluating if a candidate's answer is aligned with the question.
-Be lenient; only flag answers that are completely off-topic (e.g., cooking for a Python question).
+Be extremely lenient. Only flag answers as irrelevant if they are completely off-topic and unrelated to the question or resume (e.g., discussing cooking when asked about a coding project).
 
 Question: {question}
 Answer: {answer}
@@ -210,8 +210,10 @@ Resume: \"{resume_text}\"
 Category: {category}
 
 Instructions:
-1. If the answer is completely unrelated (e.g., cooking when asked about coding), classify as "strongly_irrelevant" with reason: "I didn’t get your answer."
-2. Otherwise, classify as "strongly_relevant" with empty reason.
+1. If the answer has no connection to the question or resume (e.g., unrelated topics like cooking or sports),
+   classify as "strongly_irrelevant" with reason: "I didn’t get your answer".
+2. If the answer mentions the topic, project, or role from the question/resume (even vaguely), classify as "strongly_relevant" with empty reason.
+3. Do not penalize for lack of detail or clarity—focus solely on topical relevance.
 
 Return a JSON object:
 {{ "alignment": "strongly_relevant|strongly_irrelevant", "reason": "<short reason>" }}
@@ -227,6 +229,73 @@ Return a JSON object:
     except Exception as e:
         logger.error(f"Error checking answer alignment: {e}")
         return "strongly_relevant", ""
+
+async def process_complete_answer(session_id: str, last_answer: str, last_qa: dict, current_type: str, difficulty: str):
+    session = interview_sessions.get(session_id)
+    if not session:
+        logger.error(f"Session {session_id} not found during answer processing")
+        raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+
+    # Check answer alignment
+    alignment, reason = check_answer_alignment(
+        question=last_qa["question"],
+        answer=last_answer,
+        resume_text=session["resume"],
+        category=current_type
+    )
+
+    logger.info(f"Alignment check for session {session_id}: alignment={alignment}, reason={reason}, retries={session.get('irrelevant_retries', 0)}")
+
+    if alignment == "strongly_irrelevant":
+        session["irrelevant_retries"] = session.get("irrelevant_retries", 0) + 1
+        logger.info(f"Incremented irrelevant retries for session {session_id} to {session['irrelevant_retries']}")
+        if session["irrelevant_retries"] >= MAX_IRRELEVANT_RETRIES:
+            follow_up = "Please focus on the question. Let's move to the next one."
+            session["irrelevant_retries"] = 0
+            # Determine next category
+            current_count = session["question_count"].get("general", 0)
+            if session["phase"] == "general" and current_count < 3:
+                next_category = "general"
+            else:
+                if session["phase"] != "technical_projects":
+                    session["phase"] = "technical_projects"
+                next_category = "technical" if current_type == "projects" else "projects"
+            try:
+                next_question = run_interview(session["resume"], session["qa_history"], next_category, difficulty)
+                session["qa_history"].append({"question": follow_up, "type": current_type})
+                session["qa_history"].append({"question": next_question, "type": next_category})
+                session["question_count"][next_category] = session["question_count"].get(next_category, 0) + 1
+                logger.info(f"Max irrelevant retries reached for session {session_id}. New question: {next_question}, category: {next_category}")
+                return {"success": True, "question": next_question, "message": "", "speak_only": False, "end_interview": False}
+            except Exception as e:
+                logger.error(f"Failed to generate new question for session {session_id}: {str(e)}")
+                raise HTTPException(status_code=500, detail=f"Failed to generate new question: {str(e)}")
+        else:
+            follow_up = "I didn’t quite get how your answer relates to the question. Could you try again?"
+            session["qa_history"].append({"question": follow_up, "type": current_type})
+            logger.info(f"Strongly irrelevant answer detected for session {session_id}, retries remaining: {MAX_IRRELEVANT_RETRIES - session['irrelevant_retries']}")
+            return {"success": True, "question": follow_up, "message": follow_up, "speak_only": True, "end_interview": False}
+    else:
+        # Reset retries and proceed to next question if relevant (even if vague)
+        session["irrelevant_retries"] = 0
+        logger.info(f"Reset irrelevant retries for session {session_id} due to relevant answer (alignment: {alignment})")
+        current_count = session["question_count"].get("general", 0)
+        if session["phase"] == "general" and current_count < 3:
+            next_category = "general"
+        else:
+            if session["phase"] != "technical_projects":
+                session["phase"] = "technical_projects"
+                logger.info(f"Transitioned to technical_projects phase for session {session_id}")
+            next_category = "technical" if current_type == "projects" else "projects"
+        try:
+            next_question = run_interview(session["resume"], session["qa_history"], next_category, difficulty)
+            session["qa_history"].append({"question": next_question, "type": next_category})
+            session["question_count"][next_category] = session["question_count"].get(next_category, 0) + 1
+            logger.info(f"Generated next question for session {session_id}: {next_question}, category: {next_category}")
+            return {"success": True, "question": next_question, "message": "", "speak_only": False, "end_interview": False}
+        except Exception as e:
+            logger.error(f"Failed to generate next question for session {session_id}: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Failed to generate new question: {str(e)}")
 
 # ====== ROUTES ======
 
@@ -375,97 +444,6 @@ async def submit_answer(request: UserResponse, background_tasks: BackgroundTasks
     session_id = request.session_id
     background_tasks.add_task(check_answer_completion)
     return {"success": True, "message": f"Partial answer noted, waiting {DEBOUNCE_DELAY} seconds for completion", "end_interview": False}
-
-async def process_complete_answer(session_id: str, last_answer: str, last_qa: dict, current_type: str, difficulty: str):
-    session = interview_sessions.get(session_id)
-    if not session:
-        logger.error(f"Session {session_id} not found during answer processing")
-        raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
-
-    # Check if answer is too short (unclear)
-    if len(last_answer.strip().split()) < 5:
-        follow_up = "Could you provide more details or clarify your response?"
-        session["qa_history"].append({"question": follow_up, "type": current_type})
-        session["irrelevant_retries"] = 0  # Reset retries for unclear answer
-        logger.info(f"Unclear/short answer detected for session {session_id}: {last_answer}")
-        return {"success": True, "question": follow_up, "message": follow_up, "speak_only": True, "end_interview": False}
-
-    # Check answer alignment
-    alignment, reason = check_answer_alignment(
-        question=last_qa["question"],
-        answer=last_answer,
-        resume_text=session["resume"],
-        category=current_type
-    )
-
-    logger.info(f"Alignment check for session {session_id}: alignment={alignment}, reason={reason}, retries={session.get('irrelevant_retries', 0)}")
-
-    if alignment == "strongly_irrelevant":
-        session["irrelevant_retries"] = session.get("irrelevant_retries", 0) + 1
-        logger.info(f"Incremented irrelevant retries for session {session_id} to {session['irrelevant_retries']}")
-        if session["irrelevant_retries"] >= MAX_IRRELEVANT_RETRIES:
-            follow_up = "Please focus on the question. Let's move to the next one."
-            session["irrelevant_retries"] = 0  # Reset retries
-            # Determine next category
-            current_count = session["question_count"].get("general", 0)
-            logger.info(f"Current general question count: {current_count}, phase: {session['phase']}")
-            if session["phase"] == "general" and current_count < 3:
-                next_category = "general"
-            else:
-                if session["phase"] != "technical_projects":
-                    session["phase"] = "technical_projects"
-                    logger.info(f"Transitioned to technical_projects phase for session {session_id}")
-                next_category = "technical" if current_type == "projects" else "projects"
-            try:
-                next_question = run_interview(
-                    session["resume"],
-                    session["qa_history"],
-                    next_category,
-                    difficulty
-                )
-                session["qa_history"].append({"question": follow_up, "type": current_type})
-                session["qa_history"].append({"question": next_question, "type": next_category})
-                session["question_count"][next_category] = session["question_count"].get(next_category, 0) + 1
-                logger.info(f"Max irrelevant retries reached for session {session_id}. New question: {next_question}, category: {next_category}, question_count: {session['question_count']}")
-                return {"success": True, "question": next_question, "message": "", "speak_only": False, "end_interview": False}
-            except Exception as e:
-                logger.error(f"Failed to generate new question for session {session_id}: {str(e)}")
-                raise HTTPException(status_code=500, detail=f"Failed to generate new question: {str(e)}")
-        else:
-            follow_up = "I didn’t quite get how your answer relates to the question. Could you try again?"
-            session["qa_history"].append({"question": follow_up, "type": current_type})
-            logger.info(f"Strongly irrelevant answer detected for session {session_id}, retries remaining: {MAX_IRRELEVANT_RETRIES - session['irrelevant_retries']}")
-            return {"success": True, "question": follow_up, "message": follow_up, "speak_only": True, "end_interview": False}
-
-    # Reset retries if answer is relevant
-    session["irrelevant_retries"] = 0
-    logger.info(f"Reset irrelevant retries for session {session_id} due to relevant answer (alignment: {alignment})")
-
-    # Decide next category
-    current_count = session["question_count"].get("general", 0)
-    if session["phase"] == "general" and current_count < 3:
-        next_category = "general"
-    else:
-        if session["phase"] != "technical_projects":
-            session["phase"] = "technical_projects"
-            logger.info(f"Transitioned to technical_projects phase for session {session_id}")
-        next_category = "technical" if current_type == "projects" else "projects"
-
-    # Generate next question
-    try:
-        next_question = run_interview(
-            session["resume"],
-            session["qa_history"],
-            next_category,
-            difficulty
-        )
-        session["qa_history"].append({"question": next_question, "type": next_category})
-        session["question_count"][next_category] = session["question_count"].get(next_category, 0) + 1
-        logger.info(f"Generated next question for session {session_id}: {next_question}, category: {next_category}, question_count: {session['question_count']}")
-        return {"success": True, "question": next_question, "message": "", "speak_only": False, "end_interview": False}
-    except Exception as e:
-        logger.error(f"Failed to generate next question for session {session_id}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to generate new question: {str(e)}")
 
 @app.post("/end-interview")
 async def end_interview(request: EndInterviewRequest):
