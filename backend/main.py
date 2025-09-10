@@ -202,8 +202,7 @@ Instructions:
 def check_answer_alignment(question: str, answer: str, resume_text: str, category: str) -> tuple[str, str]:
     system_prompt = f"""
 You are an HR interviewer evaluating if a candidate's answer is aligned with the question.
-Do NOT be overly strict. Even if the answer is unclear, incomplete, or contains minor mistakes, 
-if it is on the right topic, consider it at least partially relevant.
+Do NOT be strict. Only flag answers that are completely off-topic.
 
 Question: {question}
 Answer: {answer}
@@ -211,28 +210,24 @@ Resume: \"{resume_text}\"
 Category: {category}
 
 Instructions:
-1. Check if the answer is aligned with the topic of the question.
-   - Example: If the question is about Python, answers about cooking are strongly irrelevant.
-2. Classify the answer into one of these categories:
-   - "strongly_relevant": The answer clearly addresses the question with correct topic/context.
-   - "partially_relevant": The answer mentions the right topic but is incomplete, unclear, or slightly off.
-   - "strongly_irrelevant": The answer is completely off-topic or unrelated.
-3. Provide a short reason (max 20 words).
+1. If the answer is completely unrelated to the question (e.g., talking about cooking when asked about Python), 
+   classify as "strongly_irrelevant" with reason: "I didn’t get your answer".
+2. Otherwise, classify as "strongly_relevant" with empty reason.
 
 Return a JSON object:
-{{ "alignment": "strongly_relevant|partially_relevant|strongly_irrelevant", "reason": "<short reason>" }}
+{{ "alignment": "strongly_relevant|strongly_irrelevant", "reason": "<short reason>" }}
 """.strip()
 
     try:
         response = conversation.invoke(
-            {"input": "Evaluate the answer alignment.", "system_prompt": system_prompt},
+            {"input": "Evaluate answer relevance.", "system_prompt": system_prompt},
             config={"configurable": {"session_id": "alignment_check"}},
         ).content.strip()
         result = json.loads(response)
-        return result.get("alignment", "partially_relevant"), result.get("reason", "")
+        return result.get("alignment", "strongly_relevant"), result.get("reason", "")
     except Exception as e:
         logger.error(f"Error checking answer alignment: {e}")
-        return "partially_relevant", "Failed to evaluate"
+        return "strongly_relevant", ""
 
 
 # ====== ROUTES ======
