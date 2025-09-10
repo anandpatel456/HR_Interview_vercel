@@ -199,46 +199,38 @@ Instructions:
         logger.error(f"Error generating feedback: {e}")
         raise HTTPException(status_code=500, detail="Failed to generate feedback due to API error")
 
-def check_answer_relevance(question: str, answer: str, resume_text: str, category: str) -> tuple[int, str]:
+def check_answer_alignment(question: str, answer: str, resume_text: str, category: str) -> tuple[str, str]:
     system_prompt = f"""
-You are an HR expert evaluating how relevant a candidate's answer is to a mock interview question.
+You are an HR interviewer evaluating if a candidate's answer is aligned with the question.
 
 Question: {question}
 Answer: {answer}
-Resume: "{resume_text}"
+Resume: \"{resume_text}\"
 Category: {category}
 
 Instructions:
-1. Score relevance on a scale of 0–100:
-   - 90–100 → Fully relevant (direct, detailed, aligned with resume).
-   - 70–89 → Mostly relevant (answers question with basic reason, even if brief or imperfect grammar).
-   - 40–69 → Weak relevance (somewhat related but unclear/incomplete).
-   - 0–39 → Irrelevant (off-topic, nonsense, or unrelated).
-2. Consider directness (does it name a language and give a reason?) and alignment (matches category).
-3. Short answers naming a language with a simple reason should score 70–89 unless off-topic.
-4. Return ONLY a JSON object with:
-   - "score" (integer 0–100)
-   - "reason" (short explanation ≤15 words)
+1. Check if the answer is aligned with the topic of the question.
+   - Example: If the question is about Python, answers about cooking are strongly irrelevant.
+2. Classify the answer into one of these categories:
+   - "strongly_relevant": The answer directly addresses the question and is correct/on-topic.
+   - "partially_relevant": The answer is somewhat on-topic but incomplete, vague, or only partially correct.
+   - "strongly_irrelevant": The answer is off-topic or unrelated (e.g., cooking when asked about Python).
+3. Provide a short reason (max 20 words).
 
-Example:
-Q: "Which programming language do you feel comfortable using, and why?"
-A: "I like Python because it's easy."
-→ {{ "score": 85, "reason": "Names Python, gives simple reason." }}
-A: "I enjoy cooking."
-→ {{ "score": 10, "reason": "Unrelated to programming languages." }}
+Return a JSON object:
+{{ "alignment": "strongly_relevant|partially_relevant|strongly_irrelevant", "reason": "<short reason>" }}
 """.strip()
 
     try:
         response = conversation.invoke(
-            {"input": "Evaluate the relevance of the answer.", "system_prompt": system_prompt},
-            config={"configurable": {"session_id": "relevance_check"}},
+            {"input": "Evaluate the answer alignment.", "system_prompt": system_prompt},
+            config={"configurable": {"session_id": "alignment_check"}},
         ).content.strip()
         result = json.loads(response)
-        logger.info(f"Relevance check result for question '{question}': {result}")
-        return int(result.get("score", 100)), result.get("reason", "")
+        return result.get("alignment", "partially_relevant"), result.get("reason", "")
     except Exception as e:
-        logger.error(f"Error checking answer relevance: {e}")
-        return 100, ""  # Default: assume fully relevant on error
+        logger.error(f"Error checking answer alignment: {e}")
+        return "partially_relevant", "Failed to evaluate"
 
 # ====== ROUTES ======
 
@@ -397,17 +389,17 @@ async def process_complete_answer(session_id: str, last_answer: str, last_qa: di
         logger.info(f"Unclear/short answer detected for session {session_id}: {last_answer}")
         return {"success": True, "question": follow_up, "message": follow_up, "speak_only": True, "end_interview": False}
 
-    # Check answer relevance with score
-    relevance_score, reason = check_answer_relevance(
+    # Check answer alignment
+    alignment, reason = check_answer_alignment(
         question=last_qa["question"],
         answer=last_answer,
         resume_text=session["resume"],
         category=current_type
     )
 
-    logger.info(f"Relevance check for session {session_id}: relevance_score={relevance_score}, reason={reason}, retries={session.get('irrelevant_retries', 0)}")
+    logger.info(f"Alignment check for session {session_id}: alignment={alignment}, reason={reason}, retries={session.get('irrelevant_retries', 0)}")
 
-    if relevance_score < 30:
+    if alignment == "strongly_irrelevant":
         session["irrelevant_retries"] = session.get("irrelevant_retries", 0) + 1
         logger.info(f"Incremented irrelevant retries for session {session_id} to {session['irrelevant_retries']}")
         if session["irrelevant_retries"] >= MAX_IRRELEVANT_RETRIES:
@@ -441,12 +433,12 @@ async def process_complete_answer(session_id: str, last_answer: str, last_qa: di
         else:
             follow_up = "I didn’t quite get how your answer relates to the question. Could you try again?"
             session["qa_history"].append({"question": follow_up, "type": current_type})
-            logger.info(f"Irrelevant answer detected for session {session_id}, retries remaining: {MAX_IRRELEVANT_RETRIES - session['irrelevant_retries']}")
+            logger.info(f"Strongly irrelevant answer detected for session {session_id}, retries remaining: {MAX_IRRELEVANT_RETRIES - session['irrelevant_retries']}")
             return {"success": True, "question": follow_up, "message": follow_up, "speak_only": True, "end_interview": False}
 
-    # Reset retries if answer is sufficiently relevant
+    # Reset retries if answer is relevant or partially relevant
     session["irrelevant_retries"] = 0
-    logger.info(f"Reset irrelevant retries for session {session_id} due to relevant answer (score: {relevance_score})")
+    logger.info(f"Reset irrelevant retries for session {session_id} due to relevant or partially relevant answer (alignment: {alignment})")
 
     # Decide next category
     current_count = session["question_count"].get("general", 0)
