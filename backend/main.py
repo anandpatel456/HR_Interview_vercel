@@ -25,7 +25,7 @@ app = FastAPI()
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Update to ["http://localhost:3000"] or Vercel frontend URL for production
+    allow_origins=["*"],  # Update to specific origin (e.g., Vercel URL) in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -202,7 +202,7 @@ Instructions:
 def check_answer_alignment(question: str, answer: str, resume_text: str, category: str) -> tuple[str, str]:
     system_prompt = f"""
 You are an HR interviewer evaluating if a candidate's answer is aligned with the question.
-Do NOT be strict. Only flag answers that are completely off-topic.
+Be lenient; only flag answers that are completely off-topic (e.g., cooking for a Python question).
 
 Question: {question}
 Answer: {answer}
@@ -210,8 +210,7 @@ Resume: \"{resume_text}\"
 Category: {category}
 
 Instructions:
-1. If the answer is completely unrelated to the question (e.g., talking about cooking when asked about Python), 
-   classify as "strongly_irrelevant" with reason: "I didn’t get your answer".
+1. If the answer is completely unrelated (e.g., cooking when asked about coding), classify as "strongly_irrelevant" with reason: "I didn’t get your answer."
 2. Otherwise, classify as "strongly_relevant" with empty reason.
 
 Return a JSON object:
@@ -228,7 +227,6 @@ Return a JSON object:
     except Exception as e:
         logger.error(f"Error checking answer alignment: {e}")
         return "strongly_relevant", ""
-
 
 # ====== ROUTES ======
 
@@ -344,8 +342,12 @@ async def submit_answer(request: UserResponse, background_tasks: BackgroundTasks
             difficulty=session.get("difficulty", request.difficulty)
         )
 
-    # Handle partial answer
+    # Handle partial answer with rate limiting
     current_time = time.time()
+    if session.get("last_partial_timestamp") and (current_time - session["last_partial_timestamp"]) < DEBOUNCE_DELAY / 2:
+        logger.info(f"Ignoring rapid partial answer for session {request.session_id}")
+        return {"success": True, "message": "Rapid partial answer ignored, waiting for completion", "end_interview": False}
+
     session["last_partial_timestamp"] = current_time
     last_answer = last_qa["answer"]
 
@@ -434,9 +436,9 @@ async def process_complete_answer(session_id: str, last_answer: str, last_qa: di
             logger.info(f"Strongly irrelevant answer detected for session {session_id}, retries remaining: {MAX_IRRELEVANT_RETRIES - session['irrelevant_retries']}")
             return {"success": True, "question": follow_up, "message": follow_up, "speak_only": True, "end_interview": False}
 
-    # Reset retries if answer is relevant or partially relevant
+    # Reset retries if answer is relevant
     session["irrelevant_retries"] = 0
-    logger.info(f"Reset irrelevant retries for session {session_id} due to relevant or partially relevant answer (alignment: {alignment})")
+    logger.info(f"Reset irrelevant retries for session {session_id} due to relevant answer (alignment: {alignment})")
 
     # Decide next category
     current_count = session["question_count"].get("general", 0)
@@ -510,7 +512,8 @@ async def end_interview_internal(session_id: str):
 
 async def cleanup_session(session_id: str):
     await asyncio.sleep(300.0)  # Delay cleanup for 5 minutes
-    if session_id in interview_sessions and interview_sessions[session_id].get("ended", False):
+    session = interview_sessions.get(session_id)
+    if session and session.get("ended", False):
         del interview_sessions[session_id]
         if session_id in chat_histories:
             del chat_histories[session_id]
