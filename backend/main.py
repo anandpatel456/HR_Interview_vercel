@@ -202,6 +202,8 @@ Instructions:
 def check_answer_alignment(question: str, answer: str, resume_text: str, category: str) -> tuple[str, str]:
     system_prompt = f"""
 You are an HR interviewer evaluating if a candidate's answer is aligned with the question.
+Do NOT be overly strict. Even if the answer is unclear, incomplete, or contains minor mistakes, 
+if it is on the right topic, consider it at least partially relevant.
 
 Question: {question}
 Answer: {answer}
@@ -212,9 +214,9 @@ Instructions:
 1. Check if the answer is aligned with the topic of the question.
    - Example: If the question is about Python, answers about cooking are strongly irrelevant.
 2. Classify the answer into one of these categories:
-   - "strongly_relevant": The answer directly addresses the question and is correct/on-topic.
-   - "partially_relevant": The answer is somewhat on-topic but incomplete, vague, or only partially correct.
-   - "strongly_irrelevant": The answer is off-topic or unrelated (e.g., cooking when asked about Python).
+   - "strongly_relevant": The answer clearly addresses the question with correct topic/context.
+   - "partially_relevant": The answer mentions the right topic but is incomplete, unclear, or slightly off.
+   - "strongly_irrelevant": The answer is completely off-topic or unrelated.
 3. Provide a short reason (max 20 words).
 
 Return a JSON object:
@@ -231,6 +233,7 @@ Return a JSON object:
     except Exception as e:
         logger.error(f"Error checking answer alignment: {e}")
         return "partially_relevant", "Failed to evaluate"
+
 
 # ====== ROUTES ======
 
