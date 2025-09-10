@@ -407,7 +407,7 @@ async def process_complete_answer(session_id: str, last_answer: str, last_qa: di
 
     logger.info(f"Relevance check for session {session_id}: relevance_score={relevance_score}, reason={reason}, retries={session.get('irrelevant_retries', 0)}")
 
-    if relevance_score < 50:
+    if relevance_score < 30:
         session["irrelevant_retries"] = session.get("irrelevant_retries", 0) + 1
         logger.info(f"Incremented irrelevant retries for session {session_id} to {session['irrelevant_retries']}")
         if session["irrelevant_retries"] >= MAX_IRRELEVANT_RETRIES:
