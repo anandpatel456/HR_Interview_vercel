@@ -242,6 +242,7 @@ async def get_status(session_id: str):
     if not session:
         logger.error(f"Status check failed: Session {session_id} not found")
         raise HTTPException(status_code=404, detail="Session not found")
+    logger.info(f"Status check for session {session_id}: {'active' if not session.get('ended', False) else 'ended'}")
     return {"success": True, "resume_processed": bool(session["resume"])}
 
 @app.post("/upload-resume")
@@ -494,6 +495,7 @@ async def end_interview_internal(session_id: str):
         session["end_time"] = time.time()
         duration = session["end_time"] - session["start_time"]
         logger.info(f"Interview duration for session {session_id}: {duration} seconds")
+        session["ended"] = True  # Explicitly mark as ended before feedback
 
         if duration < MIN_INTERVIEW_DURATION:
             feedback = "You have to complete the interview for 1 minute to receive feedback."
@@ -501,7 +503,6 @@ async def end_interview_internal(session_id: str):
             feedback = generate_feedback(session["qa_history"])
 
         result = {"success": True, "feedback": feedback, "end_interview": True}
-        session["ended"] = True
         logger.info(f"Ended interview for session {session_id}")
         loop = asyncio.get_event_loop()
         loop.create_task(cleanup_session(session_id))
@@ -513,7 +514,7 @@ async def end_interview_internal(session_id: str):
 async def cleanup_session(session_id: str):
     await asyncio.sleep(300.0)  # Delay cleanup for 5 minutes
     session = interview_sessions.get(session_id)
-    if session and session.get("ended", False):
+    if session and session.get("ended", False) and time.time() - session.get("end_time", 0) >= 300.0:
         del interview_sessions[session_id]
         if session_id in chat_histories:
             del chat_histories[session_id]
