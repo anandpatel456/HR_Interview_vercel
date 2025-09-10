@@ -211,19 +211,21 @@ Category: {category}
 Instructions:
 1. Score relevance on a scale of 0–100:
    - 90–100 → Fully relevant (direct, detailed, aligned with resume).
-   - 70–89 → Mostly relevant (answers question but partially vague).
+   - 70–89 → Mostly relevant (answers question with basic reason, even if brief or imperfect grammar).
    - 40–69 → Weak relevance (somewhat related but unclear/incomplete).
    - 0–39 → Irrelevant (off-topic, nonsense, or unrelated).
-2. Consider both directness (does it answer the question?) and alignment (does it match resume/category?).
-3. Short but direct answers should still score high.
+2. Consider directness (does it name a language and give a reason?) and alignment (matches category).
+3. Short answers naming a language with a simple reason should score 70–89 unless off-topic.
 4. Return ONLY a JSON object with:
    - "score" (integer 0–100)
    - "reason" (short explanation ≤15 words)
 
 Example:
-Q: "What databases have you used?"
-A: "I worked with MySQL and MongoDB."
-→ {{ "score": 95, "reason": "Direct and relevant to databases." }}
+Q: "Which programming language do you feel comfortable using, and why?"
+A: "I like Python because it's easy."
+→ {{ "score": 85, "reason": "Names Python, gives simple reason." }}
+A: "I enjoy cooking."
+→ {{ "score": 10, "reason": "Unrelated to programming languages." }}
 """.strip()
 
     try:
@@ -231,10 +233,8 @@ A: "I worked with MySQL and MongoDB."
             {"input": "Evaluate the relevance of the answer.", "system_prompt": system_prompt},
             config={"configurable": {"session_id": "relevance_check"}},
         ).content.strip()
-
         result = json.loads(response)
         logger.info(f"Relevance check result for question '{question}': {result}")
-
         return int(result.get("score", 100)), result.get("reason", "")
     except Exception as e:
         logger.error(f"Error checking answer relevance: {e}")
@@ -410,58 +410,39 @@ async def process_complete_answer(session_id: str, last_answer: str, last_qa: di
     if relevance_score < 50:
         session["irrelevant_retries"] = session.get("irrelevant_retries", 0) + 1
         logger.info(f"Incremented irrelevant retries for session {session_id} to {session['irrelevant_retries']}")
-
-    if session["irrelevant_retries"] >= MAX_IRRELEVANT_RETRIES:
-        # Too many irrelevant answers → move on to the next question
-        session["irrelevant_retries"] = 0  # Reset retries
-        current_count = session["question_count"].get("general", 0)
-        logger.info(f"Current general question count: {current_count}, phase: {session['phase']}")
-
-        if session["phase"] == "general" and current_count < 3:
-            next_category = "general"
+        if session["irrelevant_retries"] >= MAX_IRRELEVANT_RETRIES:
+            follow_up = "Please focus on the question. Let's move to the next one."
+            session["irrelevant_retries"] = 0  # Reset retries
+            # Determine next category
+            current_count = session["question_count"].get("general", 0)
+            logger.info(f"Current general question count: {current_count}, phase: {session['phase']}")
+            if session["phase"] == "general" and current_count < 3:
+                next_category = "general"
+            else:
+                if session["phase"] != "technical_projects":
+                    session["phase"] = "technical_projects"
+                    logger.info(f"Transitioned to technical_projects phase for session {session_id}")
+                next_category = "technical" if current_type == "projects" else "projects"
+            try:
+                next_question = run_interview(
+                    session["resume"],
+                    session["qa_history"],
+                    next_category,
+                    difficulty
+                )
+                session["qa_history"].append({"question": follow_up, "type": current_type})
+                session["qa_history"].append({"question": next_question, "type": next_category})
+                session["question_count"][next_category] = session["question_count"].get(next_category, 0) + 1
+                logger.info(f"Max irrelevant retries reached for session {session_id}. New question: {next_question}, category: {next_category}, question_count: {session['question_count']}")
+                return {"success": True, "question": next_question, "message": "", "speak_only": False, "end_interview": False}
+            except Exception as e:
+                logger.error(f"Failed to generate new question for session {session_id}: {str(e)}")
+                raise HTTPException(status_code=500, detail=f"Failed to generate new question: {str(e)}")
         else:
-            if session["phase"] != "technical_projects":
-                session["phase"] = "technical_projects"
-                logger.info(f"Transitioned to technical_projects phase for session {session_id}")
-            next_category = "technical" if current_type == "projects" else "projects"
-
-        try:
-            next_question = run_interview(
-                session["resume"],
-                session["qa_history"],
-                next_category,
-                difficulty
-            )
-            session["qa_history"].append({"question": next_question, "type": next_category})
-            session["question_count"][next_category] = session["question_count"].get(next_category, 0) + 1
-
-            logger.info(f"Max irrelevant retries reached for session {session_id}. "
-                        f"New question: {next_question}, category: {next_category}, "
-                        f"question_count: {session['question_count']}")
-
-            return {"success": True, "question": next_question, "message": "", "speak_only": False, "end_interview": False}
-        except Exception as e:
-            logger.error(f"Failed to generate new question for session {session_id}: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Failed to generate new question: {str(e)}")
-
-    else:
-    # Give a gentle nudge instead of being silent
-     bot_reply = "I didn’t quite get how your answer relates to the question. Could you try again?"
-    session["qa_history"].append({
-        "question": last_qa["question"],
-        "answer": last_answer,
-        "bot_feedback": bot_reply,
-        "relevance_score": relevance_score
-    })
-    logger.info(f"Irrelevant answer detected for session {session_id}, retries remaining: {MAX_IRRELEVANT_RETRIES - session['irrelevant_retries']}")
-    return {
-        "success": True,
-        "question": bot_reply,
-        "message": bot_reply,
-        "speak_only": False,
-        "end_interview": False
-    }
-
+            follow_up = "I didn’t quite get how your answer relates to the question. Could you try again?"
+            session["qa_history"].append({"question": follow_up, "type": current_type})
+            logger.info(f"Irrelevant answer detected for session {session_id}, retries remaining: {MAX_IRRELEVANT_RETRIES - session['irrelevant_retries']}")
+            return {"success": True, "question": follow_up, "message": follow_up, "speak_only": True, "end_interview": False}
 
     # Reset retries if answer is sufficiently relevant
     session["irrelevant_retries"] = 0
