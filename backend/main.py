@@ -40,9 +40,10 @@ llm = ChatOpenAI(temperature=0.7, model_name="gpt-4o-mini")
 # Session storage (in-memory)
 interview_sessions: Dict[str, Dict] = {}
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
-MIN_INTERVIEW_DURATION = 60  # 1 minute in seconds
+MIN_INTERVIEW_DURATION = 60  # 1 minute in seconds for feedback eligibility
 MAX_IRRELEVANT_RETRIES = 2  # Maximum retries for irrelevant answers
-DEBOUNCE_DELAY = 3.0  # Seconds to wait for additional input before processing partial answer
+DEBOUNCE_DELAY = 7.0  # Seconds to wait for additional input before processing partial answer
+INTERVIEW_DURATION = 15 * 60  # 15 minutes in seconds
 
 def extract_text_from_pdf(file: BytesIO) -> str:
     try:
@@ -107,6 +108,7 @@ class UserResponse(BaseModel):
     session_id: str
     answer: str
     is_complete: bool = False
+    difficulty: str = "Medium"
 
 class EndInterviewRequest(BaseModel):
     session_id: str
@@ -268,7 +270,7 @@ async def upload_resume(resume: UploadFile = File(...), background_tasks: Backgr
         "ended": False,
         "difficulty": "Medium",
         "irrelevant_retries": 0,
-        "last_partial_timestamp": None  # Track last partial answer time
+        "last_partial_timestamp": None
     }
     
     background_tasks.add_task(process_resume, BytesIO(contents), session_id)
@@ -293,7 +295,7 @@ async def start_interview(request: StartInterviewRequest):
     session["difficulty"] = request.difficulty
     session["start_time"] = time.time()
     session["irrelevant_retries"] = 0
-    session["last_partial_timestamp"] = None  # Reset on start
+    session["last_partial_timestamp"] = None
     category = "general"
 
     try:
@@ -306,93 +308,21 @@ async def start_interview(request: StartInterviewRequest):
         logger.error(f"Failed to start interview for session {request.session_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to start interview: {str(e)}")
 
-async def process_complete_answer(session_id: str, last_answer: str, last_qa: dict, current_type: str):
-    session = interview_sessions.get(session_id)
-    if not session:
-        logger.error(f"Session {session_id} not found during answer processing")
-        return
-
-    # Check if answer meets minimum length requirement
-    if len(last_answer.strip().split()) < 5:
-        follow_up = "Could you provide more details or clarify your response?"
-        session["qa_history"].append({"question": follow_up, "type": current_type})
-        session["irrelevant_retries"] = 0  # Reset retries for length-related follow-up
-        logger.info(f"Short answer detected for session {session_id}: {last_answer}")
-        return {"success": True, "question": follow_up, "end_interview": False}
-
-    # Check answer relevance
-    is_relevant, reason = check_answer_relevance(
-        question=last_qa["question"],
-        answer=last_answer,
-        resume_text=session["resume"],
-        category=current_type
-    )
-
-    if not is_relevant:
-        session["irrelevant_retries"] = session.get("irrelevant_retries", 0) + 1
-        if session["irrelevant_retries"] >= MAX_IRRELEVANT_RETRIES:
-            follow_up = "Please focus on the question. Let's move to the next one."
-            session["irrelevant_retries"] = 0  # Reset retries
-            # Proceed to next question
-            if session["phase"] == "general" and session["question_count"]["general"] < 3:
-                next_category = "general"
-            else:
-                if session["phase"] != "technical_projects":
-                    session["phase"] = "technical_projects"
-                next_category = "technical" if current_type == "projects" else "projects"
-            next_question = run_interview(
-                session["resume"],
-                session["qa_history"],
-                next_category,
-                session.get("difficulty", "Medium")
-            )
-            session["qa_history"].append({"question": follow_up, "type": current_type})
-            session["qa_history"].append({"question": next_question, "type": next_category})
-            session["question_count"][next_category] += 1
-            logger.info(f"Max irrelevant retries reached for session {session_id}. Moving to next question: {next_question}")
-            return {"success": True, "question": next_question, "end_interview": False}
-        else:
-            follow_up = f"Your answer seems unrelated: {reason} Please provide a relevant response."
-            session["qa_history"].append({"question": follow_up, "type": current_type})
-            logger.info(f"Irrelevant answer detected for session {session_id}: {reason}")
-            return {"success": True, "question": follow_up, "end_interview": False}
-
-    # Reset retries if answer is relevant
-    session["irrelevant_retries"] = 0
-
-    # Decide next category
-    if session["phase"] == "general" and session["question_count"]["general"] < 3:
-        next_category = "general"
-    else:
-        if session["phase"] != "technical_projects":
-            session["phase"] = "technical_projects"
-        next_category = "technical" if current_type == "projects" else "projects"
-
-    # Generate next question
-    next_question = run_interview(
-        session["resume"],
-        session["qa_history"],
-        next_category,
-        session.get("difficulty", "Medium")
-    )
-    session["qa_history"].append({"question": next_question, "type": next_category})
-    session["question_count"][next_category] += 1
-
-    return {"success": True, "question": next_question, "end_interview": False}
-
 @app.post("/submit-answer")
 async def submit_answer(request: UserResponse, background_tasks: BackgroundTasks):
-    logger.info(f"Received submit-answer request for session_id: {request.session_id}")
+    logger.info(f"Received submit-answer request for session_id: {request.session_id}, is_complete: {request.is_complete}")
     session = interview_sessions.get(request.session_id)
     if not session or session.get("ended", False):
+        logger.error(f"Session {request.session_id} not found or already ended")
         raise HTTPException(status_code=404, detail=f"Session {request.session_id} not found or already ended")
     
     elapsed_time = time.time() - session.get("start_time", time.time())
-    if elapsed_time > 15 * 60:
-        logger.info(f"Session {request.session_id} timed out, ending interview")
+    if elapsed_time > INTERVIEW_DURATION:
+        logger.info(f"Session {request.session_id} timed out after {elapsed_time} seconds, ending interview")
         return await end_interview_internal(request.session_id)
 
     if not session["qa_history"]:
+        logger.error(f"No previous question for session {request.session_id}")
         raise HTTPException(status_code=400, detail="No previous question")
 
     last_qa = session["qa_history"][-1]
@@ -407,12 +337,13 @@ async def submit_answer(request: UserResponse, background_tasks: BackgroundTasks
 
     # If answer is marked as complete, process immediately
     if request.is_complete:
-        session["last_partial_timestamp"] = None  # Clear timestamp
+        session["last_partial_timestamp"] = None
         return await process_complete_answer(
             session_id=request.session_id,
             last_answer=last_qa["answer"],
             last_qa=last_qa,
-            current_type=last_qa["type"]
+            current_type=last_qa["type"],
+            difficulty=session.get("difficulty", request.difficulty)
         )
 
     # Handle partial answer
@@ -422,28 +353,118 @@ async def submit_answer(request: UserResponse, background_tasks: BackgroundTasks
 
     logger.info(f"Partial answer received for session {request.session_id}: {request.answer}")
 
-    # Schedule a task to check if the answer is complete after debounce delay
     async def check_answer_completion():
         await asyncio.sleep(DEBOUNCE_DELAY)
         if session_id not in interview_sessions or session.get("ended", False):
+            logger.info(f"Session {session_id} ended or not found during debounce check")
             return
-        # Check if no new partial answer was received (same timestamp)
         if session.get("last_partial_timestamp") == current_time:
             logger.info(f"Debounce period expired for session {session_id}, processing answer: {last_answer}")
             result = await process_complete_answer(
                 session_id=session_id,
                 last_answer=last_answer,
                 last_qa=last_qa,
-                current_type=last_qa["type"]
+                current_type=last_qa["type"],
+                difficulty=session.get("difficulty", "Medium")
             )
-            # Note: Since this runs in the background, the result is not returned to the client
-            # You may need to notify the client via WebSocket or polling
+            logger.info(f"Processed answer result for session {session_id}: {result}")
         else:
             logger.info(f"New partial answer received for session {session_id} during debounce period")
 
     session_id = request.session_id
     background_tasks.add_task(check_answer_completion)
     return {"success": True, "message": f"Partial answer noted, waiting {DEBOUNCE_DELAY} seconds for completion", "end_interview": False}
+
+async def process_complete_answer(session_id: str, last_answer: str, last_qa: dict, current_type: str, difficulty: str):
+    session = interview_sessions.get(session_id)
+    if not session:
+        logger.error(f"Session {session_id} not found during answer processing")
+        raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+
+    # Check if answer meets minimum length requirement
+    if len(last_answer.strip().split()) < 5:
+        follow_up = "Could you provide more details or clarify your response?"
+        session["qa_history"].append({"question": follow_up, "type": current_type})
+        session["irrelevant_retries"] = 0  # Reset retries for length-related follow-up
+        logger.info(f"Short answer detected for session {session_id}: {last_answer}")
+        return {"success": True, "question": follow_up, "message": follow_up, "end_interview": False}
+
+    # Check answer relevance
+    is_relevant, reason = check_answer_relevance(
+        question=last_qa["question"],
+        answer=last_answer,
+        resume_text=session["resume"],
+        category=current_type
+    )
+
+    logger.info(f"Relevance check for session {session_id}: is_relevant={is_relevant}, reason={reason}, retries={session.get('irrelevant_retries', 0)}")
+
+    if not is_relevant:
+        session["irrelevant_retries"] = session.get("irrelevant_retries", 0) + 1
+        logger.info(f"Incremented irrelevant retries for session {session_id} to {session['irrelevant_retries']}")
+        if session["irrelevant_retries"] >= MAX_IRRELEVANT_RETRIES:
+            follow_up = "Please focus on the question. Let's move to the next one."
+            session["irrelevant_retries"] = 0  # Reset retries
+            # Determine next category
+            current_count = session["question_count"].get("general", 0)
+            logger.info(f"Current general question count: {current_count}, phase: {session['phase']}")
+            if session["phase"] == "general" and current_count < 3:
+                next_category = "general"
+            else:
+                if session["phase"] != "technical_projects":
+                    session["phase"] = "technical_projects"
+                    logger.info(f"Transitioned to technical_projects phase for session {session_id}")
+                next_category = "technical" if current_type == "projects" else "projects"
+            try:
+                next_question = run_interview(
+                    session["resume"],
+                    session["qa_history"],
+                    next_category,
+                    difficulty
+                )
+                session["qa_history"].append({"question": follow_up, "type": current_type})
+                session["qa_history"].append({"question": next_question, "type": next_category})
+                session["question_count"][next_category] = session["question_count"].get(next_category, 0) + 1
+                logger.info(f"Max irrelevant retries reached for session {session_id}. New question: {next_question}, category: {next_category}, question_count: {session['question_count']}")
+                return {"success": True, "question": next_question, "message": "", "end_interview": False}
+            except Exception as e:
+                logger.error(f"Failed to generate new question for session {session_id}: {str(e)}")
+                raise HTTPException(status_code=500, detail=f"Failed to generate new question: {str(e)}")
+        else:
+            follow_up = f"Your answer seems unrelated: {reason} Please provide a relevant response."
+            session["qa_history"].append({"question": follow_up, "type": current_type})
+            logger.info(f"Irrelevant answer detected for session {session_id}: {reason}, retries remaining: {MAX_IRRELEVANT_RETRIES - session['irrelevant_retries']}")
+            return {"success": True, "question": follow_up, "message": follow_up, "end_interview": False}
+
+    # Reset retries if answer is relevant
+    session["irrelevant_retries"] = 0
+    logger.info(f"Reset irrelevant retries for session {session_id} due to relevant answer")
+
+    # Decide next category
+    current_count = session["question_count"].get("general", 0)
+    if session["phase"] == "general" and current_count < 3:
+        next_category = "general"
+    else:
+        if session["phase"] != "technical_projects":
+            session["phase"] = "technical_projects"
+            logger.info(f"Transitioned to technical_projects phase for session {session_id}")
+        next_category = "technical" if current_type == "projects" else "projects"
+
+    # Generate next question
+    try:
+        next_question = run_interview(
+            session["resume"],
+            session["qa_history"],
+            next_category,
+            difficulty
+        )
+        session["qa_history"].append({"question": next_question, "type": next_category})
+        session["question_count"][next_category] = session["question_count"].get(next_category, 0) + 1
+        logger.info(f"Generated next question for session {session_id}: {next_question}, category: {next_category}, question_count: {session['question_count']}")
+        return {"success": True, "question": next_question, "message": "", "end_interview": False}
+    except Exception as e:
+        logger.error(f"Failed to generate next question for session {session_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate new question: {str(e)}")
 
 @app.post("/end-interview")
 async def end_interview(request: EndInterviewRequest):
@@ -454,6 +475,7 @@ async def get_feedback(session_id: str):
     try:
         session = interview_sessions.get(session_id)
         if not session or not session.get("ended", False):
+            logger.error(f"Feedback not found or interview not ended for session {session_id}")
             raise HTTPException(status_code=404, detail="Feedback not found or interview not ended")
         feedback = generate_feedback(session["qa_history"])
         logger.info(f"Retrieved feedback for session {session_id} from memory")
@@ -492,6 +514,8 @@ async def cleanup_session(session_id: str):
     await asyncio.sleep(300.0)  # Delay cleanup for 5 minutes
     if session_id in interview_sessions and interview_sessions[session_id].get("ended", False):
         del interview_sessions[session_id]
+        if session_id in chat_histories:
+            del chat_histories[session_id]
         logger.info(f"Cleaned up session {session_id}")
 
 if __name__ == "__main__":
