@@ -42,7 +42,7 @@ interview_sessions: Dict[str, Dict] = {}
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
 MIN_INTERVIEW_DURATION = 60  # 1 minute in seconds for feedback eligibility
 MAX_IRRELEVANT_RETRIES = 2  # Maximum retries for irrelevant answers
-DEBOUNCE_DELAY = 7.0  # Seconds to wait for additional input before processing partial answer
+DEBOUNCE_DELAY = 3.0  # Seconds to wait for additional input before processing partial answer
 INTERVIEW_DURATION = 15 * 60  # 15 minutes in seconds
 
 def extract_text_from_pdf(file: BytesIO) -> str:
@@ -134,7 +134,7 @@ def run_interview(resume_text: str, chat_history: list, category: str = "general
 You are a professional HR interviewer conducting a job interview. {difficulty_instruction.get(difficulty, '')}
 
 Resume:
-\"\"\"{resume_text}\"\"
+\"\"\"{resume_text}\"\"\"
 
 Past Conversation:
 {formatted_history}
@@ -381,25 +381,25 @@ async def process_complete_answer(session_id: str, last_answer: str, last_qa: di
         logger.error(f"Session {session_id} not found during answer processing")
         raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
 
-    # Check if answer meets minimum length requirement
+    # Check if answer is too short (unclear)
     if len(last_answer.strip().split()) < 5:
         follow_up = "Could you provide more details or clarify your response?"
         session["qa_history"].append({"question": follow_up, "type": current_type})
-        session["irrelevant_retries"] = 0  # Reset retries for length-related follow-up
-        logger.info(f"Short answer detected for session {session_id}: {last_answer}")
-        return {"success": True, "question": follow_up, "message": follow_up, "end_interview": False}
+        session["irrelevant_retries"] = 0  # Reset retries for unclear answer
+        logger.info(f"Unclear/short answer detected for session {session_id}: {last_answer}")
+        return {"success": True, "question": follow_up, "message": follow_up, "speak_only": True, "end_interview": False}
 
-    # Check answer relevance
-    is_relevant, reason = check_answer_relevance(
+    # Check answer relevance with score
+    relevance_score, reason = check_answer_relevance(
         question=last_qa["question"],
         answer=last_answer,
         resume_text=session["resume"],
         category=current_type
     )
 
-    logger.info(f"Relevance check for session {session_id}: is_relevant={is_relevant}, reason={reason}, retries={session.get('irrelevant_retries', 0)}")
+    logger.info(f"Relevance check for session {session_id}: relevance_score={relevance_score}, reason={reason}, retries={session.get('irrelevant_retries', 0)}")
 
-    if not is_relevant:
+    if relevance_score < 65:
         session["irrelevant_retries"] = session.get("irrelevant_retries", 0) + 1
         logger.info(f"Incremented irrelevant retries for session {session_id} to {session['irrelevant_retries']}")
         if session["irrelevant_retries"] >= MAX_IRRELEVANT_RETRIES:
@@ -426,7 +426,7 @@ async def process_complete_answer(session_id: str, last_answer: str, last_qa: di
                 session["qa_history"].append({"question": next_question, "type": next_category})
                 session["question_count"][next_category] = session["question_count"].get(next_category, 0) + 1
                 logger.info(f"Max irrelevant retries reached for session {session_id}. New question: {next_question}, category: {next_category}, question_count: {session['question_count']}")
-                return {"success": True, "question": next_question, "message": "", "end_interview": False}
+                return {"success": True, "question": next_question, "message": "", "speak_only": False, "end_interview": False}
             except Exception as e:
                 logger.error(f"Failed to generate new question for session {session_id}: {str(e)}")
                 raise HTTPException(status_code=500, detail=f"Failed to generate new question: {str(e)}")
@@ -434,11 +434,11 @@ async def process_complete_answer(session_id: str, last_answer: str, last_qa: di
             follow_up = f"Your answer seems unrelated: {reason} Please provide a relevant response."
             session["qa_history"].append({"question": follow_up, "type": current_type})
             logger.info(f"Irrelevant answer detected for session {session_id}: {reason}, retries remaining: {MAX_IRRELEVANT_RETRIES - session['irrelevant_retries']}")
-            return {"success": True, "question": follow_up, "message": follow_up, "end_interview": False}
+            return {"success": True, "question": follow_up, "message": follow_up, "speak_only": False, "end_interview": False}
 
-    # Reset retries if answer is relevant
+    # Reset retries if answer is sufficiently relevant
     session["irrelevant_retries"] = 0
-    logger.info(f"Reset irrelevant retries for session {session_id} due to relevant answer")
+    logger.info(f"Reset irrelevant retries for session {session_id} due to relevant answer (score: {relevance_score})")
 
     # Decide next category
     current_count = session["question_count"].get("general", 0)
@@ -461,7 +461,7 @@ async def process_complete_answer(session_id: str, last_answer: str, last_qa: di
         session["qa_history"].append({"question": next_question, "type": next_category})
         session["question_count"][next_category] = session["question_count"].get(next_category, 0) + 1
         logger.info(f"Generated next question for session {session_id}: {next_question}, category: {next_category}, question_count: {session['question_count']}")
-        return {"success": True, "question": next_question, "message": "", "end_interview": False}
+        return {"success": True, "question": next_question, "message": "", "speak_only": False, "end_interview": False}
     except Exception as e:
         logger.error(f"Failed to generate next question for session {session_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to generate new question: {str(e)}")
